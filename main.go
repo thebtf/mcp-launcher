@@ -56,8 +56,8 @@ type mcpClient struct {
 	closeOnce sync.Once
 }
 
-func newMCPClient(binary, cwd, envMode string) (*mcpClient, error) {
-	cmd := exec.Command(binary)
+func newMCPClient(binary, cwd, envMode string, extraArgs []string) (*mcpClient, error) {
+	cmd := exec.Command(binary, extraArgs...)
 	cmd.Dir = cwd
 	cmd.Stderr = os.Stderr
 
@@ -241,9 +241,9 @@ func cleanEnv() []string {
 // Session bootstrap — shared by all modes
 // ---------------------------------------------------------------------------
 
-func initSession(binary, cwd, envMode string) *mcpClient {
-	fmt.Printf("  spawn %s (cwd=%s, env=%s)\n", binary, cwd, envMode)
-	client, err := newMCPClient(binary, cwd, envMode)
+func initSession(binary, cwd, envMode string, extraArgs []string) *mcpClient {
+	fmt.Printf("  spawn %s %v (cwd=%s, env=%s)\n", binary, extraArgs, cwd, envMode)
+	client, err := newMCPClient(binary, cwd, envMode, extraArgs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  FAIL spawn: %v\n", err)
 		os.Exit(1)
@@ -285,9 +285,9 @@ func initSession(binary, cwd, envMode string) *mcpClient {
 // Modes
 // ---------------------------------------------------------------------------
 
-func runHold(binary, cwd, envMode string, holdSec int) {
+func runHold(binary, cwd, envMode string, holdSec int, extraArgs []string) {
 	fmt.Println("[hold] Starting MCP session...")
-	client := initSession(binary, cwd, envMode)
+	client := initSession(binary, cwd, envMode, extraArgs)
 	defer client.close()
 
 	fmt.Printf("[hold] Session live (pid=%d). Holding for %ds.\n", client.pid(), holdSec)
@@ -301,7 +301,7 @@ func runHold(binary, cwd, envMode string, holdSec int) {
 	}
 }
 
-func runTest(binary, cwd, envMode, ctlSocket, daemonFlag string) {
+func runTest(binary, cwd, envMode, ctlSocket, daemonFlag string, extraArgs []string) {
 	fmt.Println("[test] Start daemon + session, trigger graceful-restart, verify")
 
 	daemon := exec.Command(binary, daemonFlag)
@@ -315,7 +315,7 @@ func runTest(binary, cwd, envMode, ctlSocket, daemonFlag string) {
 	fmt.Printf("  daemon pid=%d\n", daemon.Process.Pid)
 	time.Sleep(3 * time.Second)
 
-	client := initSession(binary, cwd, envMode)
+	client := initSession(binary, cwd, envMode, extraArgs)
 	time.Sleep(3 * time.Second)
 
 	status, err := controlSend(ctlSocket, "status", 5*time.Second)
@@ -349,7 +349,7 @@ func runTest(binary, cwd, envMode, ctlSocket, daemonFlag string) {
 	fmt.Println("[test] Done.")
 }
 
-func runPhase2(binary, cwd, envMode, ctlSocket, daemonFlag string) {
+func runPhase2(binary, cwd, envMode, ctlSocket, daemonFlag string, extraArgs []string) {
 	fmt.Println("[phase2] Full test: Phase 1 bootstrap + Phase 2 on successor")
 
 	daemon := exec.Command(binary, daemonFlag)
@@ -363,7 +363,7 @@ func runPhase2(binary, cwd, envMode, ctlSocket, daemonFlag string) {
 	fmt.Printf("  daemon pid=%d\n", daemon.Process.Pid)
 	time.Sleep(3 * time.Second)
 
-	client := initSession(binary, cwd, envMode)
+	client := initSession(binary, cwd, envMode, extraArgs)
 	time.Sleep(3 * time.Second)
 
 	fmt.Println("\n--- Phase 1: graceful-restart ---")
@@ -442,13 +442,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	extraArgs := flag.Args()
+
 	switch *mode {
 	case "hold":
-		runHold(*binary, *cwd, *envMode, *holdSec)
+		runHold(*binary, *cwd, *envMode, *holdSec, extraArgs)
 	case "test":
-		runTest(*binary, *cwd, *envMode, *ctlSocket, *daemonFlag)
+		runTest(*binary, *cwd, *envMode, *ctlSocket, *daemonFlag, extraArgs)
 	case "phase2":
-		runPhase2(*binary, *cwd, *envMode, *ctlSocket, *daemonFlag)
+		runPhase2(*binary, *cwd, *envMode, *ctlSocket, *daemonFlag, extraArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown mode %q (use hold, test, or phase2)\n", *mode)
 		os.Exit(1)

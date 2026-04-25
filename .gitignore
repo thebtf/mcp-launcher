@@ -1,0 +1,5 @@
+mcp-launcher
+mcp-launcher.exe
+*.old
+*.tmp
+.agent/data/

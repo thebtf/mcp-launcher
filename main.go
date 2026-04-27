@@ -12,6 +12,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -21,6 +22,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -207,6 +209,56 @@ func controlSend(socketPath, cmd string, timeout time.Duration) (map[string]any,
 		return nil, fmt.Errorf("unmarshal response: %w", err)
 	}
 	return resp, nil
+}
+
+func getDaemonPID(ctlSocket string) (int, error) {
+	resp, err := controlSend(ctlSocket, "status", 5*time.Second)
+	if err != nil {
+		return -1, err
+	}
+
+	toInt := func(v any) (int, bool) {
+		switch n := v.(type) {
+		case float64:
+			return int(n), true
+		case int:
+			return n, true
+		}
+		return -1, false
+	}
+
+	if pid, ok := toInt(resp["pid"]); ok {
+		return pid, nil
+	}
+	if pid, ok := toInt(resp["daemon_pid"]); ok {
+		return pid, nil
+	}
+	if daemon, ok := resp["daemon"].(map[string]any); ok {
+		if pid, ok := toInt(daemon["pid"]); ok {
+			return pid, nil
+		}
+	}
+
+	return -1, fmt.Errorf("no pid field in status response: %v", resp)
+}
+
+func pidAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	err = proc.Signal(syscall.Signal(0))
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
+		return false
+	}
+	return runtime.GOOS != "windows"
 }
 
 // ---------------------------------------------------------------------------
@@ -401,6 +453,89 @@ func runPhase2(binary, cwd, envMode, ctlSocket, daemonFlag string, extraArgs []s
 	fmt.Println("[phase2] Done.")
 }
 
+func runPersist(binary, cwd, envMode, ctlSocket, daemonFlag string, watchSec int, extraArgs []string) {
+	fmt.Println("[persist] Start daemon + session, disconnect stdio, verify daemon persistence")
+
+	daemon := exec.Command(binary, daemonFlag)
+	daemon.Dir = cwd
+	daemon.Env = os.Environ()
+	daemon.Stderr = os.Stderr
+	if err := daemon.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "  FAIL start daemon: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("  daemon pid=%d\n", daemon.Process.Pid)
+	time.Sleep(3 * time.Second)
+
+	fmt.Println("  Session A: connect")
+	clientA := initSession(binary, cwd, envMode, extraArgs)
+
+	daemonPIDA, err := getDaemonPID(ctlSocket)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  FAIL daemon pid after Session A: %v\n", err)
+		clientA.close()
+		os.Exit(1)
+	}
+	fmt.Printf("  Session A daemon pid=%d\n", daemonPIDA)
+
+	fmt.Println("  Session A: closing stdio")
+	clientA.close()
+
+	start := time.Now()
+	fmt.Printf("  watching daemon for %ds\n", watchSec)
+
+	checkAlive := func(elapsed time.Duration) bool {
+		alive := pidAlive(daemonPIDA)
+		fmt.Printf("  [t+%ds] daemon pid=%d alive=%v\n", int(elapsed.Seconds()), daemonPIDA, alive)
+		if !alive {
+			fmt.Printf("  FAIL: daemon pid %d died during watch window\n", daemonPIDA)
+			return false
+		}
+		return true
+	}
+
+	if !checkAlive(0) {
+		os.Exit(1)
+	}
+
+	watchDeadline := start.Add(time.Duration(watchSec) * time.Second)
+	for {
+		remaining := time.Until(watchDeadline)
+		if remaining <= 0 {
+			break
+		}
+
+		wait := 5 * time.Second
+		if remaining < wait {
+			wait = remaining
+		}
+
+		time.Sleep(wait)
+		if !checkAlive(time.Since(start)) {
+			os.Exit(1)
+		}
+	}
+
+	fmt.Println("  Session B: reconnect")
+	clientB := initSession(binary, cwd, envMode, extraArgs)
+	defer clientB.close()
+
+	daemonPIDB, err := getDaemonPID(ctlSocket)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  FAIL daemon pid after Session B: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("  Session B daemon pid=%d\n", daemonPIDB)
+
+	if daemonPIDA == daemonPIDB {
+		fmt.Printf("  PASS: daemon pid %d stayed alive for %ds and reconnect reused same pid\n", daemonPIDA, watchSec)
+		return
+	}
+
+	fmt.Printf("  FAIL: daemon pid changed across reconnect (A=%d, B=%d)\n", daemonPIDA, daemonPIDB)
+	os.Exit(1)
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -408,8 +543,9 @@ func runPhase2(binary, cwd, envMode, ctlSocket, daemonFlag string, extraArgs []s
 func main() {
 	binary := flag.String("binary", "", "MCP server executable (required)")
 	cwd := flag.String("cwd", ".", "working directory for subprocess")
-	mode := flag.String("mode", "hold", "mode: hold, test, phase2")
+	mode := flag.String("mode", "hold", "mode: hold, test, phase2, persist")
 	holdSec := flag.Int("hold", 300, "hold duration in seconds (hold mode)")
+	watchSec := flag.Int("watch", 60, "watch duration in seconds after disconnect (persist mode)")
 	ctlSocket := flag.String("ctl", "", "daemon control socket path (required for test/phase2)")
 	daemonFlag := flag.String("daemon-flag", "--muxcore-daemon", "flag to start server in daemon mode")
 	envMode := flag.String("env-mode", "full", "environment mode: full (CC-style) or clean (Codex-style)")
@@ -422,10 +558,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  hold    Spawn server, hold session open for external testing (default)")
 		fmt.Fprintln(os.Stderr, "  test    Single-phase graceful-restart test")
 		fmt.Fprintln(os.Stderr, "  phase2  Two-phase restart test (deadlock reproducer)")
+		fmt.Fprintln(os.Stderr, "  persist Verify daemon stays alive across stdio disconnect + reconnect")
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintln(os.Stderr, "  mcp-launcher -binary ./my-server -mode hold")
 		fmt.Fprintln(os.Stderr, "  mcp-launcher -binary ./my-server -mode test -ctl /tmp/my-ctl.sock")
 		fmt.Fprintln(os.Stderr, "  mcp-launcher -binary ./my-server -mode phase2 -ctl /tmp/my-ctl.sock")
+		fmt.Fprintln(os.Stderr, "  mcp-launcher -binary ./my-server -mode persist -ctl /tmp/my-ctl.sock -watch 60")
 		os.Exit(1)
 	}
 
@@ -437,7 +575,7 @@ func main() {
 		}
 	}
 
-	if (*mode == "test" || *mode == "phase2") && *ctlSocket == "" {
+	if (*mode == "test" || *mode == "phase2" || *mode == "persist") && *ctlSocket == "" {
 		fmt.Fprintf(os.Stderr, "error: -ctl is required for %s mode\n", *mode)
 		os.Exit(1)
 	}
@@ -451,8 +589,10 @@ func main() {
 		runTest(*binary, *cwd, *envMode, *ctlSocket, *daemonFlag, extraArgs)
 	case "phase2":
 		runPhase2(*binary, *cwd, *envMode, *ctlSocket, *daemonFlag, extraArgs)
+	case "persist":
+		runPersist(*binary, *cwd, *envMode, *ctlSocket, *daemonFlag, *watchSec, extraArgs)
 	default:
-		fmt.Fprintf(os.Stderr, "error: unknown mode %q (use hold, test, or phase2)\n", *mode)
+		fmt.Fprintf(os.Stderr, "error: unknown mode %q (use hold, test, phase2, or persist)\n", *mode)
 		os.Exit(1)
 	}
 }

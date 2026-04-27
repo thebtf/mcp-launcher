@@ -30,9 +30,10 @@ mcp-launcher -binary <server> [options]
 |------|---------|-------------|
 | `-binary` | (required) | MCP server executable path |
 | `-cwd` | `.` | Working directory for the subprocess |
-| `-mode` | `hold` | Mode: `hold`, `test`, or `phase2` |
+| `-mode` | `hold` | Mode: `hold`, `test`, `phase2`, or `persist` |
 | `-hold` | `300` | How long to hold the session in seconds (hold mode) |
-| `-ctl` | (required for test/phase2) | Daemon control socket path |
+| `-watch` | `60` | How long to watch the daemon after disconnect in seconds (persist mode) |
+| `-ctl` | (required for test/phase2/persist) | Daemon control socket path |
 | `-daemon-flag` | `--muxcore-daemon` | Flag to start server in daemon mode |
 | `-env-mode` | `full` | `full` (CC-style, inherit all env) or `clean` (Codex-style, platform allow-list) |
 
@@ -60,6 +61,14 @@ The full test: Phase 1 restarts the original daemon (creating a successor), then
 
 ```bash
 mcp-launcher -binary ./my-server -mode phase2 -ctl /tmp/my-ctl.sock
+```
+
+#### `persist` — verify daemon survives stdio disconnect
+
+Starts the daemon, opens Session A, closes stdio cleanly to simulate a Ctrl+C disconnect, polls daemon liveness for `-watch` seconds, then reconnects with Session B. `PASS` means the daemon PID stayed alive for the full watch window and Session B reattached to the same PID. `FAIL` means the daemon died or reconnect spawned a new daemon.
+
+```bash
+mcp-launcher -binary ./my-server -mode persist -ctl /tmp/my-ctl.sock -watch 60
 ```
 
 ## How it maps to real clients
@@ -109,6 +118,14 @@ mcp-launcher \
   -cwd /path/to/aimux \
   -mode phase2 \
   -ctl "$TEMP/aimux-muxd.ctl.sock"
+
+# Verify Persistent=true survives a stdio disconnect
+mcp-launcher \
+  -binary ./aimux.exe \
+  -cwd /path/to/aimux \
+  -mode persist \
+  -ctl "$TEMP/aimux-muxd.ctl.sock" \
+  -watch 30
 ```
 
 Expected output:

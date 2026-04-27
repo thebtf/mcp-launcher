@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -235,6 +236,13 @@ func getDaemonPID(ctlSocket string) (int, error) {
 	}
 	if daemon, ok := resp["daemon"].(map[string]any); ok {
 		if pid, ok := toInt(daemon["pid"]); ok {
+			return pid, nil
+		}
+	}
+	// muxcore v0.22.1+ wraps the status payload under "data" and exposes
+	// pid: os.Getpid() at the top level of that sub-map.
+	if data, ok := resp["data"].(map[string]any); ok {
+		if pid, ok := toInt(data["pid"]); ok {
 			return pid, nil
 		}
 	}
@@ -536,6 +544,86 @@ func runPersist(binary, cwd, envMode, ctlSocket, daemonFlag string, watchSec int
 	os.Exit(1)
 }
 
+func killProcess(pid int) error {
+	if runtime.GOOS == "windows" {
+		return exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid)).Run()
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	return proc.Signal(syscall.SIGKILL)
+}
+
+func waitDead(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !pidAlive(pid) {
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return !pidAlive(pid)
+}
+
+func runKillReconnect(binary, cwd, envMode, ctlSocket, _ string, extraArgs []string) {
+	fmt.Println("[kill-reconnect] Reproduce mcp-mux #104: hard-kill daemon, measure new-session recovery time")
+	fmt.Println("  (daemon is spawned ad-hoc by shim's ensureDaemon — no explicit daemon launch)")
+
+	fmt.Println("  Session A: connect")
+	clientA := initSession(binary, cwd, envMode, extraArgs)
+	time.Sleep(2 * time.Second) // let daemon settle
+
+	daemonPIDA, err := getDaemonPID(ctlSocket)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  FAIL daemon pid after Session A: %v\n", err)
+		clientA.close()
+		os.Exit(1)
+	}
+	fmt.Printf("  daemon pid (alive)=%d\n", daemonPIDA)
+
+	fmt.Printf("  hard-killing daemon pid=%d\n", daemonPIDA)
+	if err := killProcess(daemonPIDA); err != nil {
+		fmt.Fprintf(os.Stderr, "  FAIL kill: %v\n", err)
+		clientA.close()
+		os.Exit(1)
+	}
+	if !waitDead(daemonPIDA, 5*time.Second) {
+		fmt.Fprintf(os.Stderr, "  FAIL daemon pid %d still alive after 5s\n", daemonPIDA)
+		clientA.close()
+		os.Exit(1)
+	}
+	fmt.Printf("  daemon dead\n")
+
+	fmt.Println("  Session A: closing stdio (simulating CC stdio drop)")
+	clientA.close()
+
+	fmt.Println("\n=== Phase 1: spawn Session B (measures total recovery: daemon respawn + handshake + tools/list) ===")
+	start := time.Now()
+	clientB := initSession(binary, cwd, envMode, extraArgs)
+	elapsed := time.Since(start)
+	defer clientB.close()
+
+	daemonPIDB, err := getDaemonPID(ctlSocket)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  FAIL daemon pid after Session B: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("\n  total_recovery=%v daemon_pid_A=%d daemon_pid_B=%d\n", elapsed, daemonPIDA, daemonPIDB)
+
+	if daemonPIDA == daemonPIDB {
+		fmt.Printf("  WARN: daemon pid did not change — kill may have failed silently\n")
+	}
+
+	if elapsed < 30*time.Second {
+		fmt.Printf("  PASS — recovery within CC stdio 30s timeout\n")
+	} else {
+		fmt.Printf("  FAIL — recovery exceeded 30s CC stdio timeout (took %v)\n", elapsed)
+		os.Exit(2)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -543,7 +631,7 @@ func runPersist(binary, cwd, envMode, ctlSocket, daemonFlag string, watchSec int
 func main() {
 	binary := flag.String("binary", "", "MCP server executable (required)")
 	cwd := flag.String("cwd", ".", "working directory for subprocess")
-	mode := flag.String("mode", "hold", "mode: hold, test, phase2, persist")
+	mode := flag.String("mode", "hold", "mode: hold, test, phase2, persist, kill-reconnect")
 	holdSec := flag.Int("hold", 300, "hold duration in seconds (hold mode)")
 	watchSec := flag.Int("watch", 60, "watch duration in seconds after disconnect (persist mode)")
 	ctlSocket := flag.String("ctl", "", "daemon control socket path (required for test/phase2)")
@@ -575,7 +663,7 @@ func main() {
 		}
 	}
 
-	if (*mode == "test" || *mode == "phase2" || *mode == "persist") && *ctlSocket == "" {
+	if (*mode == "test" || *mode == "phase2" || *mode == "persist" || *mode == "kill-reconnect") && *ctlSocket == "" {
 		fmt.Fprintf(os.Stderr, "error: -ctl is required for %s mode\n", *mode)
 		os.Exit(1)
 	}
@@ -591,6 +679,8 @@ func main() {
 		runPhase2(*binary, *cwd, *envMode, *ctlSocket, *daemonFlag, extraArgs)
 	case "persist":
 		runPersist(*binary, *cwd, *envMode, *ctlSocket, *daemonFlag, *watchSec, extraArgs)
+	case "kill-reconnect":
+		runKillReconnect(*binary, *cwd, *envMode, *ctlSocket, *daemonFlag, extraArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown mode %q (use hold, test, phase2, or persist)\n", *mode)
 		os.Exit(1)

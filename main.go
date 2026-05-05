@@ -68,6 +68,8 @@ type sessionInfo struct {
 	ServerVersion string
 }
 
+var sessionRequestTimeout = 30 * time.Second
+
 func newMCPClient(binary, cwd, envMode string, extraArgs []string) (*mcpClient, error) {
 	cmd := exec.Command(binary, extraArgs...)
 	cmd.Dir = cwd
@@ -471,7 +473,7 @@ func initSession(binary, cwd, envMode string, extraArgs []string, expectTools in
 		"protocolVersion": "2024-11-05",
 		"clientInfo":      map[string]any{"name": "mcp-launcher", "version": "1.0.0"},
 		"capabilities":    map[string]any{"roots": map[string]any{}},
-	}, 30*time.Second)
+	}, sessionRequestTimeout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  FAIL initialize: %v\n", err)
 		client.close()
@@ -498,7 +500,7 @@ func initSession(binary, cwd, envMode string, extraArgs []string, expectTools in
 
 	client.notify("notifications/initialized", map[string]any{})
 
-	resp, err = client.call("tools/list", map[string]any{}, 30*time.Second)
+	resp, err = client.call("tools/list", map[string]any{}, sessionRequestTimeout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  FAIL tools/list: %v\n", err)
 		client.close()
@@ -924,14 +926,14 @@ func runInstall(binary, cwd, envMode, source, upgradeMode string, force bool, ti
 		fmt.Printf("  verified server version: %s\n", info.ServerVersion)
 	}
 
-	_, healthPayload, healthErr := callTool(verifyClient, "sessions", map[string]any{"action": "health"}, 30*time.Second)
+	_, healthPayload, healthErr := callTool(verifyClient, "sessions", map[string]any{"action": "health"}, sessionRequestTimeout)
 	if healthErr != nil {
 		fmt.Fprintf(os.Stderr, "  FAIL sessions(action=health): %v\n", healthErr)
 		os.Exit(1)
 	}
 	printJSON("  sessions health", healthPayload)
 
-	if _, resourcePayload, resourceErr := readResource(verifyClient, "aimux://health", 30*time.Second); resourceErr == nil {
+	if _, resourcePayload, resourceErr := readResource(verifyClient, "aimux://health", sessionRequestTimeout); resourceErr == nil {
 		printJSON("  aimux://health", resourcePayload)
 	} else {
 		fmt.Printf("  WARN aimux://health read failed: %v\n", resourceErr)
@@ -966,7 +968,7 @@ func main() {
 	ctlSocket := flag.String("ctl", "", "daemon control socket path (required for test/phase2)")
 	daemonFlag := flag.String("daemon-flag", "--muxcore-daemon", "flag to start server in daemon mode")
 	envMode := flag.String("env-mode", "full", "environment mode: full (CC-style) or clean (Codex-style)")
-	timeoutSec := flag.Int("timeout", 120, "MCP request timeout in seconds (call/tool/resource/install upgrade)")
+	timeoutSec := flag.Int("timeout", 120, "MCP request timeout in seconds, including initialize and tools/list")
 	reconnectDelaySec := flag.Int("reconnect-delay", 2, "seconds to wait before install mode reconnect verification")
 	expectTools := flag.Int("expect-tools", 0, "expected tools/list count after session init (0 disables)")
 	expectVersion := flag.String("expect-version", "", "expected MCP serverInfo.version after session init")
@@ -979,6 +981,7 @@ func main() {
 	force := flag.Bool("force", false, "force upgrade apply in install mode")
 	upgradeMode := flag.String("upgrade-mode", "auto", "upgrade mode for install: auto, hot_swap, or deferred")
 	flag.Parse()
+	sessionRequestTimeout = time.Duration(*timeoutSec) * time.Second
 
 	if *binary == "" {
 		fmt.Fprintln(os.Stderr, "error: -binary is required")

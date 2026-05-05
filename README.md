@@ -36,7 +36,7 @@ mcp-launcher -binary <server> [options]
 | `-ctl` | (required for test/phase2/persist) | Daemon control socket path |
 | `-daemon-flag` | `--muxcore-daemon` | Flag to start server in daemon mode |
 | `-env-mode` | `full` | `full` (CC-style, inherit all env) or `clean` (Codex-style, platform allow-list) |
-| `-timeout` | `120` | MCP request timeout in seconds for call/tool/resource/install upgrade calls |
+| `-timeout` | `120` | MCP request timeout in seconds, including initialize and tools/list |
 | `-expect-tools` | `0` | Expected `tools/list` count after session init; `0` disables the check |
 | `-expect-version` | (empty) | Expected MCP `serverInfo.version` after session init |
 | `-method` | (empty) | JSON-RPC method for `call` mode |

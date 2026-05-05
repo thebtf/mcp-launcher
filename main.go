@@ -7,6 +7,9 @@
 //	hold   — spawn server, hold session open for external testing (default)
 //	test   — single-phase: daemon + owner + graceful-restart + verify
 //	phase2 — two-phase: bootstrap + restart on successor (deadlock reproducer)
+//	tool   — call any MCP tool by name with JSON arguments
+//	resource — read any MCP resource by URI
+//	install — install a local binary through the server's upgrade tool, then reconnect and verify health
 package main
 
 import (
@@ -57,6 +60,12 @@ type mcpClient struct {
 	notifCh   chan jsonRPCMessage
 	closeCh   chan struct{}
 	closeOnce sync.Once
+}
+
+type sessionInfo struct {
+	ToolCount     int
+	ServerName    string
+	ServerVersion string
 }
 
 func newMCPClient(binary, cwd, envMode string, extraArgs []string) (*mcpClient, error) {
@@ -173,10 +182,157 @@ func (c *mcpClient) notify(method string, params any) {
 
 func (c *mcpClient) close() {
 	c.stdin.Close()
-	c.cmd.Wait()
+	done := make(chan error, 1)
+	go func() { done <- c.cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		_ = c.cmd.Process.Kill()
+		<-done
+	}
 }
 
 func (c *mcpClient) pid() int { return c.cmd.Process.Pid }
+
+func callTool(client *mcpClient, name string, args map[string]any, timeout time.Duration) (json.RawMessage, any, error) {
+	resp, err := client.call("tools/call", map[string]any{
+		"name":      name,
+		"arguments": args,
+	}, timeout)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	payload, err := extractToolPayload(resp)
+	if err != nil {
+		return resp, nil, err
+	}
+	return resp, payload, nil
+}
+
+func readResource(client *mcpClient, uri string, timeout time.Duration) (json.RawMessage, any, error) {
+	resp, err := client.call("resources/read", map[string]any{"uri": uri}, timeout)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	payload, err := extractResourcePayload(resp)
+	if err != nil {
+		return resp, nil, err
+	}
+	return resp, payload, nil
+}
+
+func extractToolPayload(resp json.RawMessage) (any, error) {
+	var envelope struct {
+		Error  json.RawMessage `json:"error"`
+		Result struct {
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+			IsError bool `json:"isError"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(resp, &envelope); err != nil {
+		return nil, fmt.Errorf("decode tools/call response: %w", err)
+	}
+	if len(envelope.Error) > 0 && string(envelope.Error) != "null" {
+		return nil, fmt.Errorf("json-rpc error: %s", string(envelope.Error))
+	}
+	if envelope.Result.IsError {
+		return nil, fmt.Errorf("tool returned error: %s", firstToolText(envelope.Result.Content))
+	}
+	if len(envelope.Result.Content) == 0 {
+		return map[string]any{"content": []any{}}, nil
+	}
+	text := envelope.Result.Content[0].Text
+	var payload any
+	if err := json.Unmarshal([]byte(text), &payload); err == nil {
+		return payload, nil
+	}
+	return map[string]any{"text": text}, nil
+}
+
+func firstToolText(content []struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}) string {
+	if len(content) == 0 {
+		return "<empty tool error>"
+	}
+	return content[0].Text
+}
+
+func extractResourcePayload(resp json.RawMessage) (any, error) {
+	var envelope struct {
+		Error  json.RawMessage `json:"error"`
+		Result struct {
+			Contents []struct {
+				URI      string `json:"uri"`
+				MIMEType string `json:"mimeType"`
+				Text     string `json:"text"`
+			} `json:"contents"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(resp, &envelope); err != nil {
+		return nil, fmt.Errorf("decode resources/read response: %w", err)
+	}
+	if len(envelope.Error) > 0 && string(envelope.Error) != "null" {
+		return nil, fmt.Errorf("json-rpc error: %s", string(envelope.Error))
+	}
+	if len(envelope.Result.Contents) == 0 {
+		return map[string]any{"contents": []any{}}, nil
+	}
+	text := envelope.Result.Contents[0].Text
+	var payload any
+	if err := json.Unmarshal([]byte(text), &payload); err == nil {
+		return payload, nil
+	}
+	return map[string]any{"text": text}, nil
+}
+
+func parseJSONObjectFlag(name, value string) map[string]any {
+	if strings.TrimSpace(value) == "" {
+		return map[string]any{}
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(value), &parsed); err != nil {
+		fmt.Fprintf(os.Stderr, "error: -%s must be a JSON object: %v\n", name, err)
+		os.Exit(1)
+	}
+	return parsed
+}
+
+func parseJSONValueFlag(name, value string) any {
+	if strings.TrimSpace(value) == "" {
+		return map[string]any{}
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(value), &parsed); err != nil {
+		fmt.Fprintf(os.Stderr, "error: -%s must be valid JSON: %v\n", name, err)
+		os.Exit(1)
+	}
+	return parsed
+}
+
+func printJSON(label string, value any) {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		fmt.Printf("%s: %v\n", label, value)
+		return
+	}
+	fmt.Printf("%s:\n%s\n", label, string(data))
+}
+
+func printRawJSON(label string, raw json.RawMessage) {
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		fmt.Printf("%s: %s\n", label, string(raw))
+		return
+	}
+	printJSON(label, value)
+}
 
 // ---------------------------------------------------------------------------
 // Control socket client — sends commands to daemon control socket
@@ -301,7 +457,8 @@ func cleanEnv() []string {
 // Session bootstrap — shared by all modes
 // ---------------------------------------------------------------------------
 
-func initSession(binary, cwd, envMode string, extraArgs []string) *mcpClient {
+func initSession(binary, cwd, envMode string, extraArgs []string, expectTools int, expectVersion string) (*mcpClient, sessionInfo) {
+	info := sessionInfo{}
 	fmt.Printf("  spawn %s %v (cwd=%s, env=%s)\n", binary, extraArgs, cwd, envMode)
 	client, err := newMCPClient(binary, cwd, envMode, extraArgs)
 	if err != nil {
@@ -320,7 +477,24 @@ func initSession(binary, cwd, envMode string, extraArgs []string) *mcpClient {
 		client.close()
 		os.Exit(1)
 	}
+	var initEnvelope struct {
+		Result struct {
+			ServerInfo struct {
+				Name    string `json:"name"`
+				Version string `json:"version"`
+			} `json:"serverInfo"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(resp, &initEnvelope); err == nil {
+		info.ServerName = initEnvelope.Result.ServerInfo.Name
+		info.ServerVersion = initEnvelope.Result.ServerInfo.Version
+	}
 	fmt.Printf("  initialize: %s\n", truncate(string(resp), 120))
+	if expectVersion != "" && info.ServerVersion != expectVersion {
+		fmt.Fprintf(os.Stderr, "  FAIL server version: got %q, want %q\n", info.ServerVersion, expectVersion)
+		client.close()
+		os.Exit(1)
+	}
 
 	client.notify("notifications/initialized", map[string]any{})
 
@@ -336,18 +510,24 @@ func initSession(binary, cwd, envMode string, extraArgs []string) *mcpClient {
 		} `json:"result"`
 	}
 	json.Unmarshal(resp, &tr)
-	fmt.Printf("  tools: %d\n", len(tr.Result.Tools))
+	info.ToolCount = len(tr.Result.Tools)
+	fmt.Printf("  tools: %d\n", info.ToolCount)
+	if expectTools > 0 && info.ToolCount != expectTools {
+		fmt.Fprintf(os.Stderr, "  FAIL tools count: got %d, want %d\n", info.ToolCount, expectTools)
+		client.close()
+		os.Exit(1)
+	}
 
-	return client
+	return client, info
 }
 
 // ---------------------------------------------------------------------------
 // Modes
 // ---------------------------------------------------------------------------
 
-func runHold(binary, cwd, envMode string, holdSec int, extraArgs []string) {
+func runHold(binary, cwd, envMode string, holdSec, expectTools int, expectVersion string, extraArgs []string) {
 	fmt.Println("[hold] Starting MCP session...")
-	client := initSession(binary, cwd, envMode, extraArgs)
+	client, _ := initSession(binary, cwd, envMode, extraArgs, expectTools, expectVersion)
 	defer client.close()
 
 	fmt.Printf("[hold] Session live (pid=%d). Holding for %ds.\n", client.pid(), holdSec)
@@ -375,7 +555,7 @@ func runTest(binary, cwd, envMode, ctlSocket, daemonFlag string, extraArgs []str
 	fmt.Printf("  daemon pid=%d\n", daemon.Process.Pid)
 	time.Sleep(3 * time.Second)
 
-	client := initSession(binary, cwd, envMode, extraArgs)
+	client, _ := initSession(binary, cwd, envMode, extraArgs, 0, "")
 	time.Sleep(3 * time.Second)
 
 	status, err := controlSend(ctlSocket, "status", 5*time.Second)
@@ -423,7 +603,7 @@ func runPhase2(binary, cwd, envMode, ctlSocket, daemonFlag string, extraArgs []s
 	fmt.Printf("  daemon pid=%d\n", daemon.Process.Pid)
 	time.Sleep(3 * time.Second)
 
-	client := initSession(binary, cwd, envMode, extraArgs)
+	client, _ := initSession(binary, cwd, envMode, extraArgs, 0, "")
 	time.Sleep(3 * time.Second)
 
 	fmt.Println("\n--- Phase 1: graceful-restart ---")
@@ -476,7 +656,7 @@ func runPersist(binary, cwd, envMode, ctlSocket, daemonFlag string, watchSec int
 	time.Sleep(3 * time.Second)
 
 	fmt.Println("  Session A: connect")
-	clientA := initSession(binary, cwd, envMode, extraArgs)
+	clientA, _ := initSession(binary, cwd, envMode, extraArgs, 0, "")
 
 	daemonPIDA, err := getDaemonPID(ctlSocket)
 	if err != nil {
@@ -525,7 +705,7 @@ func runPersist(binary, cwd, envMode, ctlSocket, daemonFlag string, watchSec int
 	}
 
 	fmt.Println("  Session B: reconnect")
-	clientB := initSession(binary, cwd, envMode, extraArgs)
+	clientB, _ := initSession(binary, cwd, envMode, extraArgs, 0, "")
 	defer clientB.close()
 
 	daemonPIDB, err := getDaemonPID(ctlSocket)
@@ -571,7 +751,7 @@ func runKillReconnect(binary, cwd, envMode, ctlSocket, _ string, extraArgs []str
 	fmt.Println("  (daemon is spawned ad-hoc by shim's ensureDaemon — no explicit daemon launch)")
 
 	fmt.Println("  Session A: connect")
-	clientA := initSession(binary, cwd, envMode, extraArgs)
+	clientA, _ := initSession(binary, cwd, envMode, extraArgs, 0, "")
 	time.Sleep(2 * time.Second) // let daemon settle
 
 	daemonPIDA, err := getDaemonPID(ctlSocket)
@@ -600,7 +780,7 @@ func runKillReconnect(binary, cwd, envMode, ctlSocket, _ string, extraArgs []str
 
 	fmt.Println("\n=== Phase 1: spawn Session B (measures total recovery: daemon respawn + handshake + tools/list) ===")
 	start := time.Now()
-	clientB := initSession(binary, cwd, envMode, extraArgs)
+	clientB, _ := initSession(binary, cwd, envMode, extraArgs, 0, "")
 	elapsed := time.Since(start)
 	defer clientB.close()
 
@@ -624,6 +804,155 @@ func runKillReconnect(binary, cwd, envMode, ctlSocket, _ string, extraArgs []str
 	}
 }
 
+func runRawCall(binary, cwd, envMode, method, paramsJSON string, timeoutSec, expectTools int, expectVersion string, extraArgs []string) {
+	if method == "" {
+		fmt.Fprintln(os.Stderr, "error: -method is required for call mode")
+		os.Exit(1)
+	}
+
+	fmt.Printf("[call] %s\n", method)
+	client, _ := initSession(binary, cwd, envMode, extraArgs, expectTools, expectVersion)
+	defer client.close()
+
+	resp, err := client.call(method, parseJSONValueFlag("params", paramsJSON), time.Duration(timeoutSec)*time.Second)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  FAIL call %s: %v\n", method, err)
+		os.Exit(1)
+	}
+	printRawJSON("  response", resp)
+}
+
+func runTool(binary, cwd, envMode, toolName, argsJSON string, timeoutSec, expectTools int, expectVersion string, extraArgs []string) {
+	if toolName == "" {
+		fmt.Fprintln(os.Stderr, "error: -tool is required for tool mode")
+		os.Exit(1)
+	}
+
+	fmt.Printf("[tool] %s\n", toolName)
+	client, _ := initSession(binary, cwd, envMode, extraArgs, expectTools, expectVersion)
+	defer client.close()
+
+	resp, payload, err := callTool(client, toolName, parseJSONObjectFlag("args", argsJSON), time.Duration(timeoutSec)*time.Second)
+	if err != nil {
+		if resp != nil {
+			printRawJSON("  response", resp)
+		}
+		fmt.Fprintf(os.Stderr, "  FAIL tool %s: %v\n", toolName, err)
+		os.Exit(1)
+	}
+	printRawJSON("  response", resp)
+	printJSON("  payload", payload)
+}
+
+func runResource(binary, cwd, envMode, uri string, timeoutSec, expectTools int, expectVersion string, extraArgs []string) {
+	if uri == "" {
+		fmt.Fprintln(os.Stderr, "error: -uri is required for resource mode")
+		os.Exit(1)
+	}
+
+	fmt.Printf("[resource] %s\n", uri)
+	client, _ := initSession(binary, cwd, envMode, extraArgs, expectTools, expectVersion)
+	defer client.close()
+
+	resp, payload, err := readResource(client, uri, time.Duration(timeoutSec)*time.Second)
+	if err != nil {
+		if resp != nil {
+			printRawJSON("  response", resp)
+		}
+		fmt.Fprintf(os.Stderr, "  FAIL resource %s: %v\n", uri, err)
+		os.Exit(1)
+	}
+	printRawJSON("  response", resp)
+	printJSON("  payload", payload)
+}
+
+func runInstall(binary, cwd, envMode, source, upgradeMode string, force bool, timeoutSec, reconnectDelaySec, expectTools int, expectVersion string, extraArgs []string) {
+	if source == "" {
+		fmt.Fprintln(os.Stderr, "error: -source is required for install mode")
+		os.Exit(1)
+	}
+	absSource, err := filepath.Abs(source)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: resolve -source: %v\n", err)
+		os.Exit(1)
+	}
+	if _, err := os.Stat(absSource); err != nil {
+		fmt.Fprintf(os.Stderr, "error: source binary is not readable: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("[install] Starting installed daemon session")
+	client, _ := initSession(binary, cwd, envMode, extraArgs, 0, "")
+
+	args := map[string]any{
+		"action": "apply",
+		"source": absSource,
+		"force":  force,
+	}
+	if upgradeMode != "" {
+		args["mode"] = upgradeMode
+	}
+
+	fmt.Printf("[install] Calling upgrade(action=apply, source=%q, force=%v, mode=%q)\n", absSource, force, upgradeMode)
+	resp, payload, err := callTool(client, "upgrade", args, time.Duration(timeoutSec)*time.Second)
+	if err != nil {
+		if isExpectedUpgradeDisconnect(err) {
+			fmt.Printf("  upgrade connection closed during apply: %v\n", err)
+			fmt.Println("  continuing to reconnect verification")
+		} else {
+			if resp != nil {
+				printRawJSON("  upgrade response", resp)
+			}
+			fmt.Fprintf(os.Stderr, "  FAIL upgrade: %v\n", err)
+			client.close()
+			os.Exit(1)
+		}
+	} else {
+		printJSON("  upgrade payload", payload)
+	}
+
+	fmt.Println("[install] Closing install session")
+	client.close()
+	if reconnectDelaySec > 0 {
+		time.Sleep(time.Duration(reconnectDelaySec) * time.Second)
+	}
+
+	fmt.Println("[install] Reconnecting and verifying installed daemon")
+	verifyClient, info := initSession(binary, cwd, envMode, extraArgs, expectTools, expectVersion)
+	defer verifyClient.close()
+	if info.ServerVersion != "" {
+		fmt.Printf("  verified server version: %s\n", info.ServerVersion)
+	}
+
+	_, healthPayload, healthErr := callTool(verifyClient, "sessions", map[string]any{"action": "health"}, 30*time.Second)
+	if healthErr != nil {
+		fmt.Fprintf(os.Stderr, "  FAIL sessions(action=health): %v\n", healthErr)
+		os.Exit(1)
+	}
+	printJSON("  sessions health", healthPayload)
+
+	if _, resourcePayload, resourceErr := readResource(verifyClient, "aimux://health", 30*time.Second); resourceErr == nil {
+		printJSON("  aimux://health", resourcePayload)
+	} else {
+		fmt.Printf("  WARN aimux://health read failed: %v\n", resourceErr)
+	}
+
+	fmt.Println("[install] PASS")
+}
+
+func isExpectedUpgradeDisconnect(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection closed") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "forcibly closed") ||
+		strings.Contains(msg, "use of closed") ||
+		strings.Contains(msg, "upstream restarted") ||
+		strings.Contains(msg, "request lost during reconnect")
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -631,12 +960,24 @@ func runKillReconnect(binary, cwd, envMode, ctlSocket, _ string, extraArgs []str
 func main() {
 	binary := flag.String("binary", "", "MCP server executable (required)")
 	cwd := flag.String("cwd", ".", "working directory for subprocess")
-	mode := flag.String("mode", "hold", "mode: hold, test, phase2, persist, kill-reconnect")
+	mode := flag.String("mode", "hold", "mode: hold, call, tool, resource, install, test, phase2, persist, kill-reconnect")
 	holdSec := flag.Int("hold", 300, "hold duration in seconds (hold mode)")
 	watchSec := flag.Int("watch", 60, "watch duration in seconds after disconnect (persist mode)")
 	ctlSocket := flag.String("ctl", "", "daemon control socket path (required for test/phase2)")
 	daemonFlag := flag.String("daemon-flag", "--muxcore-daemon", "flag to start server in daemon mode")
 	envMode := flag.String("env-mode", "full", "environment mode: full (CC-style) or clean (Codex-style)")
+	timeoutSec := flag.Int("timeout", 120, "MCP request timeout in seconds (call/tool/resource/install upgrade)")
+	reconnectDelaySec := flag.Int("reconnect-delay", 2, "seconds to wait before install mode reconnect verification")
+	expectTools := flag.Int("expect-tools", 0, "expected tools/list count after session init (0 disables)")
+	expectVersion := flag.String("expect-version", "", "expected MCP serverInfo.version after session init")
+	method := flag.String("method", "", "JSON-RPC method for call mode")
+	paramsJSON := flag.String("params", "{}", "JSON params for call mode")
+	toolName := flag.String("tool", "", "MCP tool name for tool mode")
+	argsJSON := flag.String("args", "{}", "JSON object arguments for tool mode")
+	uri := flag.String("uri", "", "MCP resource URI for resource mode")
+	source := flag.String("source", "", "local source binary for install mode")
+	force := flag.Bool("force", false, "force upgrade apply in install mode")
+	upgradeMode := flag.String("upgrade-mode", "auto", "upgrade mode for install: auto, hot_swap, or deferred")
 	flag.Parse()
 
 	if *binary == "" {
@@ -644,11 +985,18 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\nUsage: mcp-launcher -binary <server> [options]\n\n")
 		fmt.Fprintln(os.Stderr, "Modes:")
 		fmt.Fprintln(os.Stderr, "  hold    Spawn server, hold session open for external testing (default)")
+		fmt.Fprintln(os.Stderr, "  call    Call any JSON-RPC method after MCP initialize")
+		fmt.Fprintln(os.Stderr, "  tool    Call any MCP tool by name with JSON arguments")
+		fmt.Fprintln(os.Stderr, "  resource Read any MCP resource by URI")
+		fmt.Fprintln(os.Stderr, "  install Install a local binary via upgrade tool, reconnect, and verify health")
 		fmt.Fprintln(os.Stderr, "  test    Single-phase graceful-restart test")
 		fmt.Fprintln(os.Stderr, "  phase2  Two-phase restart test (deadlock reproducer)")
 		fmt.Fprintln(os.Stderr, "  persist Verify daemon stays alive across stdio disconnect + reconnect")
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintln(os.Stderr, "  mcp-launcher -binary ./my-server -mode hold")
+		fmt.Fprintln(os.Stderr, "  mcp-launcher -binary ./aimux-dev.exe -mode tool -tool sessions -args '{\"action\":\"health\"}'")
+		fmt.Fprintln(os.Stderr, "  mcp-launcher -binary ./aimux-dev.exe -mode resource -uri aimux://health")
+		fmt.Fprintln(os.Stderr, "  mcp-launcher -binary ./aimux-dev.exe -mode install -source ./aimux-dev-next.exe -force -expect-tools 27")
 		fmt.Fprintln(os.Stderr, "  mcp-launcher -binary ./my-server -mode test -ctl /tmp/my-ctl.sock")
 		fmt.Fprintln(os.Stderr, "  mcp-launcher -binary ./my-server -mode phase2 -ctl /tmp/my-ctl.sock")
 		fmt.Fprintln(os.Stderr, "  mcp-launcher -binary ./my-server -mode persist -ctl /tmp/my-ctl.sock -watch 60")
@@ -672,7 +1020,15 @@ func main() {
 
 	switch *mode {
 	case "hold":
-		runHold(*binary, *cwd, *envMode, *holdSec, extraArgs)
+		runHold(*binary, *cwd, *envMode, *holdSec, *expectTools, *expectVersion, extraArgs)
+	case "call":
+		runRawCall(*binary, *cwd, *envMode, *method, *paramsJSON, *timeoutSec, *expectTools, *expectVersion, extraArgs)
+	case "tool":
+		runTool(*binary, *cwd, *envMode, *toolName, *argsJSON, *timeoutSec, *expectTools, *expectVersion, extraArgs)
+	case "resource":
+		runResource(*binary, *cwd, *envMode, *uri, *timeoutSec, *expectTools, *expectVersion, extraArgs)
+	case "install":
+		runInstall(*binary, *cwd, *envMode, *source, *upgradeMode, *force, *timeoutSec, *reconnectDelaySec, *expectTools, *expectVersion, extraArgs)
 	case "test":
 		runTest(*binary, *cwd, *envMode, *ctlSocket, *daemonFlag, extraArgs)
 	case "phase2":
@@ -682,7 +1038,7 @@ func main() {
 	case "kill-reconnect":
 		runKillReconnect(*binary, *cwd, *envMode, *ctlSocket, *daemonFlag, extraArgs)
 	default:
-		fmt.Fprintf(os.Stderr, "error: unknown mode %q (use hold, test, phase2, or persist)\n", *mode)
+		fmt.Fprintf(os.Stderr, "error: unknown mode %q (use hold, call, tool, resource, install, test, phase2, persist, or kill-reconnect)\n", *mode)
 		os.Exit(1)
 	}
 }

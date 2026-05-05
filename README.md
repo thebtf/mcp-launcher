@@ -30,12 +30,24 @@ mcp-launcher -binary <server> [options]
 |------|---------|-------------|
 | `-binary` | (required) | MCP server executable path |
 | `-cwd` | `.` | Working directory for the subprocess |
-| `-mode` | `hold` | Mode: `hold`, `test`, `phase2`, or `persist` |
+| `-mode` | `hold` | Mode: `hold`, `call`, `tool`, `resource`, `install`, `test`, `phase2`, `persist`, or `kill-reconnect` |
 | `-hold` | `300` | How long to hold the session in seconds (hold mode) |
 | `-watch` | `60` | How long to watch the daemon after disconnect in seconds (persist mode) |
 | `-ctl` | (required for test/phase2/persist) | Daemon control socket path |
 | `-daemon-flag` | `--muxcore-daemon` | Flag to start server in daemon mode |
 | `-env-mode` | `full` | `full` (CC-style, inherit all env) or `clean` (Codex-style, platform allow-list) |
+| `-timeout` | `120` | MCP request timeout in seconds for call/tool/resource/install upgrade calls |
+| `-expect-tools` | `0` | Expected `tools/list` count after session init; `0` disables the check |
+| `-expect-version` | (empty) | Expected MCP `serverInfo.version` after session init |
+| `-method` | (empty) | JSON-RPC method for `call` mode |
+| `-params` | `{}` | JSON params for `call` mode |
+| `-tool` | (empty) | MCP tool name for `tool` mode |
+| `-args` | `{}` | JSON object arguments for `tool` mode |
+| `-uri` | (empty) | MCP resource URI for `resource` mode |
+| `-source` | (empty) | Local source binary for `install` mode |
+| `-force` | `false` | Force `upgrade(action=apply)` in `install` mode |
+| `-upgrade-mode` | `auto` | Upgrade mode for `install`: `auto`, `hot_swap`, or `deferred` |
+| `-reconnect-delay` | `2` | Seconds to wait before `install` mode reconnect verification |
 
 ### Modes
 
@@ -45,6 +57,44 @@ Spawns the server, completes the MCP handshake, and holds the session open. Use 
 
 ```bash
 mcp-launcher -binary ./my-server -mode hold -hold 600
+```
+
+#### `call` — call any JSON-RPC method
+
+Spawns the server, completes the MCP handshake, and calls the JSON-RPC method passed via `-method` with JSON params from `-params`.
+
+```bash
+mcp-launcher -binary ./my-server -mode call -method tools/list -params '{}'
+```
+
+#### `tool` — call any MCP tool
+
+Calls `tools/call` with a tool name and JSON object arguments, then prints both the raw MCP response and the decoded text payload when the tool returns JSON text.
+
+```bash
+mcp-launcher -binary ./aimux-dev.exe -mode tool -tool sessions -args '{"action":"health"}'
+```
+
+#### `resource` — read any MCP resource
+
+Calls `resources/read` for the URI passed via `-uri`, then prints both the raw MCP response and the decoded text payload when the resource returns JSON text.
+
+```bash
+mcp-launcher -binary ./aimux-dev.exe -mode resource -uri aimux://health
+```
+
+#### `install` — install a local binary through the MCP upgrade tool
+
+Emulates a project-scoped MCP client that can call `upgrade(action="apply", source=..., force=true)`. The mode starts the installed binary, calls the `upgrade` tool with `-source`, closes stdio so deferred restarts can complete, reconnects, then verifies `sessions(action="health")` and `aimux://health`.
+
+```bash
+mcp-launcher \
+  -binary ./aimux-dev.exe \
+  -cwd /path/to/aimux \
+  -mode install \
+  -source ./aimux-dev-next.exe \
+  -force \
+  -expect-tools 27
 ```
 
 #### `test` — single-phase graceful-restart
@@ -135,7 +185,7 @@ Expected output:
   spawn ./aimux.exe (cwd=..., env=full)
   pid=12346
   initialize: {"jsonrpc":"2.0","id":1,"result":{...}}
-  tools: 37
+  tools: N
 
 --- Phase 1: graceful-restart ---
   Phase 1 OK: snapshot written, shutting down (133ms)

@@ -72,7 +72,8 @@ awkward times.
 - Exercise daemon control sockets while the stdio client is still connected.
 - Check that deferred binary installs become visible before reconnect
   verification starts.
-- Switch between full inherited environment and a clean allow-list environment.
+- Switch between full inherited environment and a clean allow-list environment
+  that still preserves lifecycle-critical EOF policy when set.
 
 ## Requirements
 
@@ -116,7 +117,7 @@ mcp-launcher -binary <server> [options] [-- extra server args...]
 | `-watch` | `60` | Seconds to watch daemon liveness after disconnect in `persist` mode. |
 | `-ctl` | empty | Daemon control socket path. Required for `test`, `phase2`, `persist`, and `kill-reconnect`. |
 | `-daemon-flag` | `--muxcore-daemon` | Flag used to start the target server in daemon mode. |
-| `-env-mode` | `full` | `full` passes the parent environment; `clean` forwards a platform allow-list. |
+| `-env-mode` | `full` | `full` passes the parent environment; `clean` forwards a platform allow-list and preserves `AIMUX_STDIN_EOF_POLICY` when set. |
 | `-timeout` | `120` | MCP request timeout in seconds, including initialize and `tools/list`. |
 | `-expect-tools` | `0` | Expected `tools/list` count after session init. `0` disables the check. |
 | `-expect-version` | empty | Expected MCP `serverInfo.version` after session init. |
@@ -186,7 +187,9 @@ mcp-launcher \
 `install` mode fingerprints the installed binary, calls `upgrade`, closes the
 install session, waits for post-exit replacement when the payload or disconnect
 indicates one is scheduled, reconnects, calls `sessions(action="health")`, and
-tries to read `aimux://health` when that resource exists.
+tries to read `aimux://health` when that resource exists. With `-env-mode clean`,
+the launcher still preserves `AIMUX_STDIN_EOF_POLICY` from the parent
+environment so aimux shims can use eager stdin EOF during install handoff.
 
 ### Verify daemon persistence across stdio disconnect
 
@@ -228,9 +231,10 @@ The project is intentionally small:
   and collects notifications separately.
 - `controlSend` talks to a raw Unix domain control socket for daemon status and
   graceful restart commands.
-- `main_test.go` and `install_reconnect_test.go` cover client cleanup on tool
-  errors, Windows PID fallback cleanup, install reconnect delay decisions,
-  post-exit install detection, replacement waiting, and binary fingerprinting.
+- `main_test.go`, `install_reconnect_test.go`, and `env_test.go` cover client
+  cleanup on tool errors, Windows PID fallback cleanup, clean environment
+  preservation, install reconnect delay decisions, post-exit install detection,
+  replacement waiting, and binary fingerprinting.
 
 ## MCP Session Flow
 

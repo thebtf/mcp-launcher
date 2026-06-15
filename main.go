@@ -548,6 +548,7 @@ func cleanEnv() []string {
 			"LANG", "LC_ALL", "TERM", "TMPDIR", "TZ",
 		}
 	}
+	keys = append(keys, "AIMUX_STDIN_EOF_POLICY")
 	var env []string
 	for _, k := range keys {
 		if v, ok := os.LookupEnv(k); ok {

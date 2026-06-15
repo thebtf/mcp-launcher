@@ -7,6 +7,11 @@ tags for public releases.
 
 ## [Unreleased]
 
+### Fixed
+
+- `-env-mode clean` now preserves `AIMUX_STDIN_EOF_POLICY` when present so
+  aimux install smokes keep their eager stdin EOF contract.
+
 ## [0.1.0] - 2026-06-15
 
 ### Added

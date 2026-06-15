@@ -8,6 +8,7 @@ mcp-launcher.exe
 .agent/reports/
 .agent/security/
 .agent/session-state/
+.agent/specs/
 .agent/CONTINUITY.md
 .agent/CONTINUITY-archive/
 

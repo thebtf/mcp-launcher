@@ -47,7 +47,8 @@ mcp-launcher -binary <server> [options]
 | `-source` | (empty) | Local source binary for `install` mode |
 | `-force` | `false` | Force `upgrade(action=apply)` in `install` mode |
 | `-upgrade-mode` | `auto` | Upgrade mode for `install`: `auto`, `hot_swap`, or `deferred` |
-| `-reconnect-delay` | `2` | Seconds to wait before `install` mode reconnect verification |
+| `-reconnect-delay` | `2` | Initial/retry delay for `install` mode reconnect verification; post-exit installs automatically use a longer default grace window |
+| `-cleanup-binary-processes` | `false` | Best-effort cleanup after one-shot modes for remaining processes with the same image name as `-binary`; use only with unique smoke binary copies |
 
 ### Modes
 
@@ -85,7 +86,9 @@ mcp-launcher -binary ./aimux-dev.exe -mode resource -uri aimux://health
 
 #### `install` — install a local binary through the MCP upgrade tool
 
-Emulates a project-scoped MCP client that can call `upgrade(action="apply", source=..., force=true)`. The mode starts the installed binary, calls the `upgrade` tool with `-source`, closes stdio so deferred restarts can complete, reconnects, then verifies `sessions(action="health")` and `aimux://health`.
+Emulates a project-scoped MCP client that can call `upgrade(action="apply", source=..., force=true)`. The mode starts the installed binary, calls the `upgrade` tool with `-source`, closes stdio so deferred restarts can complete, reconnects, then verifies `sessions(action="health")` and `aimux://health`. When the upgrade response reports a deferred post-exit install, the default path waits for the installed binary to change before reconnect verification spawns a new client. The replacement check polls every 15 seconds unless `-reconnect-delay` is explicitly set.
+
+`-cleanup-binary-processes` is smoke-test cleanup, not a production process manager. On Windows it currently uses image-name `taskkill`; access-denied failures can still leave a daemon alive, so use unique disposable binary names and check for survivors after a cleanup warning.
 
 ```bash
 mcp-launcher \

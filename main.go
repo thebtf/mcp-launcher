@@ -14,10 +14,12 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -69,6 +71,17 @@ type sessionInfo struct {
 }
 
 var sessionRequestTimeout = 30 * time.Second
+
+const (
+	defaultInstallReconnectDelaySec  = 2
+	postExitInstallReconnectDelaySec = 15
+)
+
+type fileFingerprint struct {
+	Size    int64
+	ModTime time.Time
+	SHA256  string
+}
 
 func newMCPClient(binary, cwd, envMode string, extraArgs []string) (*mcpClient, error) {
 	cmd := exec.Command(binary, extraArgs...)
@@ -427,6 +440,29 @@ func pidAlive(pid int) bool {
 	return runtime.GOOS != "windows"
 }
 
+func cleanupBinaryProcesses(binary string) error {
+	name := filepath.Base(binary)
+	if strings.TrimSpace(name) == "" || name == "." || name == string(filepath.Separator) {
+		return fmt.Errorf("cannot derive process image name from %q", binary)
+	}
+
+	switch runtime.GOOS {
+	case "windows":
+		cmd := exec.Command("taskkill", "/F", "/IM", name)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			output := strings.TrimSpace(string(out))
+			if strings.Contains(strings.ToLower(output), "not found") {
+				return nil
+			}
+			return fmt.Errorf("taskkill %s: %w: %s", name, err, output)
+		}
+		return nil
+	default:
+		return fmt.Errorf("cleanup-binary-processes is not implemented on %s", runtime.GOOS)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Clean env (Codex-style platform allow-list)
 // ---------------------------------------------------------------------------
@@ -459,13 +495,12 @@ func cleanEnv() []string {
 // Session bootstrap — shared by all modes
 // ---------------------------------------------------------------------------
 
-func initSession(binary, cwd, envMode string, extraArgs []string, expectTools int, expectVersion string) (*mcpClient, sessionInfo) {
+func tryInitSession(binary, cwd, envMode string, extraArgs []string, expectTools int, expectVersion string) (*mcpClient, sessionInfo, error) {
 	info := sessionInfo{}
 	fmt.Printf("  spawn %s %v (cwd=%s, env=%s)\n", binary, extraArgs, cwd, envMode)
 	client, err := newMCPClient(binary, cwd, envMode, extraArgs)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "  FAIL spawn: %v\n", err)
-		os.Exit(1)
+		return nil, info, fmt.Errorf("spawn: %w", err)
 	}
 	fmt.Printf("  pid=%d\n", client.pid())
 
@@ -475,9 +510,8 @@ func initSession(binary, cwd, envMode string, extraArgs []string, expectTools in
 		"capabilities":    map[string]any{"roots": map[string]any{}},
 	}, sessionRequestTimeout)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "  FAIL initialize: %v\n", err)
 		client.close()
-		os.Exit(1)
+		return nil, info, fmt.Errorf("initialize: %w", err)
 	}
 	var initEnvelope struct {
 		Result struct {
@@ -493,18 +527,16 @@ func initSession(binary, cwd, envMode string, extraArgs []string, expectTools in
 	}
 	fmt.Printf("  initialize: %s\n", truncate(string(resp), 120))
 	if expectVersion != "" && info.ServerVersion != expectVersion {
-		fmt.Fprintf(os.Stderr, "  FAIL server version: got %q, want %q\n", info.ServerVersion, expectVersion)
 		client.close()
-		os.Exit(1)
+		return nil, info, fmt.Errorf("server version: got %q, want %q", info.ServerVersion, expectVersion)
 	}
 
 	client.notify("notifications/initialized", map[string]any{})
 
 	resp, err = client.call("tools/list", map[string]any{}, sessionRequestTimeout)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "  FAIL tools/list: %v\n", err)
 		client.close()
-		os.Exit(1)
+		return nil, info, fmt.Errorf("tools/list: %w", err)
 	}
 	var tr struct {
 		Result struct {
@@ -515,11 +547,19 @@ func initSession(binary, cwd, envMode string, extraArgs []string, expectTools in
 	info.ToolCount = len(tr.Result.Tools)
 	fmt.Printf("  tools: %d\n", info.ToolCount)
 	if expectTools > 0 && info.ToolCount != expectTools {
-		fmt.Fprintf(os.Stderr, "  FAIL tools count: got %d, want %d\n", info.ToolCount, expectTools)
 		client.close()
-		os.Exit(1)
+		return nil, info, fmt.Errorf("tools count: got %d, want %d", info.ToolCount, expectTools)
 	}
 
+	return client, info, nil
+}
+
+func initSession(binary, cwd, envMode string, extraArgs []string, expectTools int, expectVersion string) (*mcpClient, sessionInfo) {
+	client, info, err := tryInitSession(binary, cwd, envMode, extraArgs, expectTools, expectVersion)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  FAIL %v\n", err)
+		os.Exit(1)
+	}
 	return client, info
 }
 
@@ -806,50 +846,54 @@ func runKillReconnect(binary, cwd, envMode, ctlSocket, _ string, extraArgs []str
 	}
 }
 
-func runRawCall(binary, cwd, envMode, method, paramsJSON string, timeoutSec, expectTools int, expectVersion string, extraArgs []string) {
+func runRawCall(binary, cwd, envMode, method, paramsJSON string, timeoutSec, expectTools int, expectVersion string, extraArgs []string) int {
 	if method == "" {
 		fmt.Fprintln(os.Stderr, "error: -method is required for call mode")
-		os.Exit(1)
+		return 1
 	}
+	params := parseJSONValueFlag("params", paramsJSON)
 
 	fmt.Printf("[call] %s\n", method)
 	client, _ := initSession(binary, cwd, envMode, extraArgs, expectTools, expectVersion)
 	defer client.close()
 
-	resp, err := client.call(method, parseJSONValueFlag("params", paramsJSON), time.Duration(timeoutSec)*time.Second)
+	resp, err := client.call(method, params, time.Duration(timeoutSec)*time.Second)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  FAIL call %s: %v\n", method, err)
-		os.Exit(1)
+		return 1
 	}
 	printRawJSON("  response", resp)
+	return 0
 }
 
-func runTool(binary, cwd, envMode, toolName, argsJSON string, timeoutSec, expectTools int, expectVersion string, extraArgs []string) {
+func runTool(binary, cwd, envMode, toolName, argsJSON string, timeoutSec, expectTools int, expectVersion string, extraArgs []string) int {
 	if toolName == "" {
 		fmt.Fprintln(os.Stderr, "error: -tool is required for tool mode")
-		os.Exit(1)
+		return 1
 	}
+	args := parseJSONObjectFlag("args", argsJSON)
 
 	fmt.Printf("[tool] %s\n", toolName)
 	client, _ := initSession(binary, cwd, envMode, extraArgs, expectTools, expectVersion)
 	defer client.close()
 
-	resp, payload, err := callTool(client, toolName, parseJSONObjectFlag("args", argsJSON), time.Duration(timeoutSec)*time.Second)
+	resp, payload, err := callTool(client, toolName, args, time.Duration(timeoutSec)*time.Second)
 	if err != nil {
 		if resp != nil {
 			printRawJSON("  response", resp)
 		}
 		fmt.Fprintf(os.Stderr, "  FAIL tool %s: %v\n", toolName, err)
-		os.Exit(1)
+		return 1
 	}
 	printRawJSON("  response", resp)
 	printJSON("  payload", payload)
+	return 0
 }
 
-func runResource(binary, cwd, envMode, uri string, timeoutSec, expectTools int, expectVersion string, extraArgs []string) {
+func runResource(binary, cwd, envMode, uri string, timeoutSec, expectTools int, expectVersion string, extraArgs []string) int {
 	if uri == "" {
 		fmt.Fprintln(os.Stderr, "error: -uri is required for resource mode")
-		os.Exit(1)
+		return 1
 	}
 
 	fmt.Printf("[resource] %s\n", uri)
@@ -862,25 +906,31 @@ func runResource(binary, cwd, envMode, uri string, timeoutSec, expectTools int, 
 			printRawJSON("  response", resp)
 		}
 		fmt.Fprintf(os.Stderr, "  FAIL resource %s: %v\n", uri, err)
-		os.Exit(1)
+		return 1
 	}
 	printRawJSON("  response", resp)
 	printJSON("  payload", payload)
+	return 0
 }
 
-func runInstall(binary, cwd, envMode, source, upgradeMode string, force bool, timeoutSec, reconnectDelaySec, expectTools int, expectVersion string, extraArgs []string) {
+func runInstall(binary, cwd, envMode, source, upgradeMode string, force bool, timeoutSec, reconnectDelaySec int, reconnectDelayExplicit bool, expectTools int, expectVersion string, extraArgs []string) int {
 	if source == "" {
 		fmt.Fprintln(os.Stderr, "error: -source is required for install mode")
-		os.Exit(1)
+		return 1
+	}
+	initialBinary, err := fingerprintFile(binary)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: fingerprint installed binary: %v\n", err)
+		return 1
 	}
 	absSource, err := filepath.Abs(source)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: resolve -source: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	if _, err := os.Stat(absSource); err != nil {
 		fmt.Fprintf(os.Stderr, "error: source binary is not readable: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	fmt.Println("[install] Starting installed daemon session")
@@ -907,30 +957,37 @@ func runInstall(binary, cwd, envMode, source, upgradeMode string, force bool, ti
 			}
 			fmt.Fprintf(os.Stderr, "  FAIL upgrade: %v\n", err)
 			client.close()
-			os.Exit(1)
+			return 1
 		}
 	} else {
 		printJSON("  upgrade payload", payload)
 	}
 
+	reconnectDelaySec = effectiveInstallReconnectDelaySec(reconnectDelaySec, reconnectDelayExplicit, payload)
+	waitForReplacement := !reconnectDelayExplicit && isPostExitInstallScheduled(payload)
+
 	fmt.Println("[install] Closing install session")
 	client.close()
-	if reconnectDelaySec > 0 {
-		time.Sleep(time.Duration(reconnectDelaySec) * time.Second)
+
+	if waitForReplacement {
+		if err := waitForInstallBinaryReplacement(binary, initialBinary, timeoutSec, reconnectDelaySec); err != nil {
+			fmt.Fprintf(os.Stderr, "  FAIL install replacement: %v\n", err)
+			return 1
+		}
+		reconnectDelaySec = 0
 	}
 
 	fmt.Println("[install] Reconnecting and verifying installed daemon")
-	verifyClient, info := initSession(binary, cwd, envMode, extraArgs, expectTools, expectVersion)
+	verifyClient, info, healthPayload, err := waitForInstallReconnect(binary, cwd, envMode, timeoutSec, reconnectDelaySec, expectTools, expectVersion, extraArgs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  FAIL reconnect verification: %v\n", err)
+		return 1
+	}
 	defer verifyClient.close()
 	if info.ServerVersion != "" {
 		fmt.Printf("  verified server version: %s\n", info.ServerVersion)
 	}
 
-	_, healthPayload, healthErr := callTool(verifyClient, "sessions", map[string]any{"action": "health"}, sessionRequestTimeout)
-	if healthErr != nil {
-		fmt.Fprintf(os.Stderr, "  FAIL sessions(action=health): %v\n", healthErr)
-		os.Exit(1)
-	}
 	printJSON("  sessions health", healthPayload)
 
 	if _, resourcePayload, resourceErr := readResource(verifyClient, "aimux://health", sessionRequestTimeout); resourceErr == nil {
@@ -940,6 +997,151 @@ func runInstall(binary, cwd, envMode, source, upgradeMode string, force bool, ti
 	}
 
 	fmt.Println("[install] PASS")
+	return 0
+}
+
+func waitForInstallReconnect(binary, cwd, envMode string, timeoutSec, reconnectDelaySec, expectTools int, expectVersion string, extraArgs []string) (*mcpClient, sessionInfo, any, error) {
+	retryDelay := time.Duration(reconnectDelaySec) * time.Second
+	if retryDelay < 0 {
+		retryDelay = 0
+	}
+	timeout := time.Duration(timeoutSec) * time.Second
+	if timeout <= 0 {
+		timeout = sessionRequestTimeout
+	}
+	deadline := time.Now().Add(timeout)
+	attempt := 0
+	var lastErr error
+
+	for {
+		if retryDelay > 0 {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				break
+			}
+			sleepFor := retryDelay
+			if sleepFor > remaining {
+				sleepFor = remaining
+			}
+			if attempt == 0 {
+				fmt.Printf("  waiting %s before reconnect verification\n", sleepFor)
+			} else {
+				fmt.Printf("  waiting %s before reconnect retry\n", sleepFor)
+			}
+			time.Sleep(sleepFor)
+		}
+		attempt++
+		if attempt > 1 {
+			fmt.Printf("  reconnect attempt %d\n", attempt)
+		}
+
+		verifyClient, info, err := tryInitSession(binary, cwd, envMode, extraArgs, expectTools, expectVersion)
+		if err == nil {
+			_, healthPayload, healthErr := callTool(verifyClient, "sessions", map[string]any{"action": "health"}, sessionRequestTimeout)
+			if healthErr == nil {
+				return verifyClient, info, healthPayload, nil
+			}
+			verifyClient.close()
+			err = fmt.Errorf("sessions(action=health): %w", healthErr)
+		}
+		lastErr = err
+
+		if !time.Now().Before(deadline) {
+			break
+		}
+		if retryDelay <= 0 {
+			break
+		}
+	}
+
+	if lastErr == nil {
+		lastErr = errors.New("reconnect verification did not run")
+	}
+	return nil, sessionInfo{}, nil, lastErr
+}
+
+func waitForInstallBinaryReplacement(binary string, before fileFingerprint, timeoutSec, pollDelaySec int) error {
+	pollDelay := time.Duration(pollDelaySec) * time.Second
+	if pollDelay <= 0 {
+		pollDelay = time.Second
+	}
+	timeout := time.Duration(timeoutSec) * time.Second
+	if timeout <= 0 {
+		timeout = sessionRequestTimeout
+	}
+	deadline := time.Now().Add(timeout)
+
+	for {
+		current, err := fingerprintFile(binary)
+		if err == nil && current.SHA256 != before.SHA256 {
+			fmt.Printf("  installed binary changed: %s -> %s\n", before.SHA256[:12], current.SHA256[:12])
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			if err != nil {
+				return fmt.Errorf("installed binary did not become readable before timeout: %w", err)
+			}
+			return fmt.Errorf("installed binary did not change before timeout")
+		}
+
+		remaining := time.Until(deadline)
+		sleepFor := pollDelay
+		if sleepFor > remaining {
+			sleepFor = remaining
+		}
+		fmt.Printf("  waiting %s for installed binary replacement\n", sleepFor)
+		time.Sleep(sleepFor)
+	}
+}
+
+func fingerprintFile(path string) (fileFingerprint, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return fileFingerprint{}, err
+	}
+	defer file.Close()
+
+	stat, err := file.Stat()
+	if err != nil {
+		return fileFingerprint{}, err
+	}
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return fileFingerprint{}, err
+	}
+
+	return fileFingerprint{
+		Size:    stat.Size(),
+		ModTime: stat.ModTime(),
+		SHA256:  fmt.Sprintf("%x", hash.Sum(nil)),
+	}, nil
+}
+
+func effectiveInstallReconnectDelaySec(requested int, explicit bool, upgradePayload any) int {
+	if explicit {
+		return requested
+	}
+	if requested < postExitInstallReconnectDelaySec && isPostExitInstallScheduled(upgradePayload) {
+		fmt.Printf("  post-exit install scheduled; using %ds reconnect delay (override with -reconnect-delay)\n", postExitInstallReconnectDelaySec)
+		return postExitInstallReconnectDelaySec
+	}
+	return requested
+}
+
+func isPostExitInstallScheduled(payload any) bool {
+	obj, ok := payload.(map[string]any)
+	if !ok {
+		return false
+	}
+	status, _ := obj["status"].(string)
+	handoffError, _ := obj["handoff_error"].(string)
+	message, _ := obj["message"].(string)
+	if strings.EqualFold(status, "updated_deferred") {
+		return true
+	}
+	text := strings.ToLower(status + " " + handoffError + " " + message)
+	return strings.Contains(text, "post-exit install scheduled")
 }
 
 func isExpectedUpgradeDisconnect(err error) bool {
@@ -969,7 +1171,7 @@ func main() {
 	daemonFlag := flag.String("daemon-flag", "--muxcore-daemon", "flag to start server in daemon mode")
 	envMode := flag.String("env-mode", "full", "environment mode: full (CC-style) or clean (Codex-style)")
 	timeoutSec := flag.Int("timeout", 120, "MCP request timeout in seconds, including initialize and tools/list")
-	reconnectDelaySec := flag.Int("reconnect-delay", 2, "seconds to wait before install mode reconnect verification")
+	reconnectDelaySec := flag.Int("reconnect-delay", defaultInstallReconnectDelaySec, "initial/retry delay in seconds for install reconnect verification")
 	expectTools := flag.Int("expect-tools", 0, "expected tools/list count after session init (0 disables)")
 	expectVersion := flag.String("expect-version", "", "expected MCP serverInfo.version after session init")
 	method := flag.String("method", "", "JSON-RPC method for call mode")
@@ -980,8 +1182,15 @@ func main() {
 	source := flag.String("source", "", "local source binary for install mode")
 	force := flag.Bool("force", false, "force upgrade apply in install mode")
 	upgradeMode := flag.String("upgrade-mode", "auto", "upgrade mode for install: auto, hot_swap, or deferred")
+	cleanupBinary := flag.Bool("cleanup-binary-processes", false, "after one-shot mode completes, kill remaining processes with the same image name as -binary; use only with unique smoke binary copies")
 	flag.Parse()
 	sessionRequestTimeout = time.Duration(*timeoutSec) * time.Second
+	reconnectDelayExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "reconnect-delay" {
+			reconnectDelayExplicit = true
+		}
+	})
 
 	if *binary == "" {
 		fmt.Fprintln(os.Stderr, "error: -binary is required")
@@ -1021,17 +1230,18 @@ func main() {
 
 	extraArgs := flag.Args()
 
+	exitCode := 0
 	switch *mode {
 	case "hold":
 		runHold(*binary, *cwd, *envMode, *holdSec, *expectTools, *expectVersion, extraArgs)
 	case "call":
-		runRawCall(*binary, *cwd, *envMode, *method, *paramsJSON, *timeoutSec, *expectTools, *expectVersion, extraArgs)
+		exitCode = runRawCall(*binary, *cwd, *envMode, *method, *paramsJSON, *timeoutSec, *expectTools, *expectVersion, extraArgs)
 	case "tool":
-		runTool(*binary, *cwd, *envMode, *toolName, *argsJSON, *timeoutSec, *expectTools, *expectVersion, extraArgs)
+		exitCode = runTool(*binary, *cwd, *envMode, *toolName, *argsJSON, *timeoutSec, *expectTools, *expectVersion, extraArgs)
 	case "resource":
-		runResource(*binary, *cwd, *envMode, *uri, *timeoutSec, *expectTools, *expectVersion, extraArgs)
+		exitCode = runResource(*binary, *cwd, *envMode, *uri, *timeoutSec, *expectTools, *expectVersion, extraArgs)
 	case "install":
-		runInstall(*binary, *cwd, *envMode, *source, *upgradeMode, *force, *timeoutSec, *reconnectDelaySec, *expectTools, *expectVersion, extraArgs)
+		exitCode = runInstall(*binary, *cwd, *envMode, *source, *upgradeMode, *force, *timeoutSec, *reconnectDelaySec, reconnectDelayExplicit, *expectTools, *expectVersion, extraArgs)
 	case "test":
 		runTest(*binary, *cwd, *envMode, *ctlSocket, *daemonFlag, extraArgs)
 	case "phase2":
@@ -1044,6 +1254,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: unknown mode %q (use hold, call, tool, resource, install, test, phase2, persist, or kill-reconnect)\n", *mode)
 		os.Exit(1)
 	}
+	if *cleanupBinary {
+		if err := cleanupBinaryProcesses(*binary); err != nil {
+			fmt.Fprintf(os.Stderr, "  WARN cleanup-binary-processes: %v\n", err)
+		}
+	}
+	os.Exit(exitCode)
 }
 
 func truncate(s string, max int) string {

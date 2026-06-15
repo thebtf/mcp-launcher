@@ -7,6 +7,8 @@ tags for public releases.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-06-15
+
 ### Added
 
 - Initial MCP stdio launcher with `hold`, `test`, and `phase2` modes for live
@@ -39,4 +41,4 @@ tags for public releases.
 - Prepared the public README, contributor guide, changelog, issue templates,
   and CI metadata for GitHub publication.
 
-Comparison links will be added after the first public release tag.
+[0.1.0]: https://github.com/thebtf/mcp-launcher/releases/tag/v0.1.0

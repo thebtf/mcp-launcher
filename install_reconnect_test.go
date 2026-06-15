@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -113,6 +114,54 @@ func TestIsPostExitInstallScheduled(t *testing.T) {
 			got := isPostExitInstallScheduled(tt.payload)
 			if got != tt.want {
 				t.Fatalf("isPostExitInstallScheduled = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShouldWaitForInstallReplacement(t *testing.T) {
+	tests := []struct {
+		name                   string
+		reconnectDelayExplicit bool
+		payload                any
+		upgradeErr             error
+		want                   bool
+	}{
+		{
+			name: "payload reports post-exit install",
+			payload: map[string]any{
+				"status": "updated_deferred",
+			},
+			want: true,
+		},
+		{
+			name:       "expected disconnect before payload",
+			upgradeErr: errors.New("connection closed while waiting for tools/call"),
+			want:       true,
+		},
+		{
+			name:                   "explicit reconnect delay overrides automatic wait",
+			reconnectDelayExplicit: true,
+			payload: map[string]any{
+				"status": "updated_deferred",
+			},
+			upgradeErr: errors.New("connection closed while waiting for tools/call"),
+			want:       false,
+		},
+		{
+			name: "ordinary payload does not wait",
+			payload: map[string]any{
+				"status": "updated",
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldWaitForInstallReplacement(tt.reconnectDelayExplicit, tt.payload, isExpectedUpgradeDisconnect(tt.upgradeErr))
+			if got != tt.want {
+				t.Fatalf("shouldWaitForInstallReplacement = %v, want %v", got, tt.want)
 			}
 		})
 	}

@@ -947,8 +947,10 @@ func runInstall(binary, cwd, envMode, source, upgradeMode string, force bool, ti
 
 	fmt.Printf("[install] Calling upgrade(action=apply, source=%q, force=%v, mode=%q)\n", absSource, force, upgradeMode)
 	resp, payload, err := callTool(client, "upgrade", args, time.Duration(timeoutSec)*time.Second)
+	upgradeDisconnected := false
 	if err != nil {
 		if isExpectedUpgradeDisconnect(err) {
+			upgradeDisconnected = true
 			fmt.Printf("  upgrade connection closed during apply: %v\n", err)
 			fmt.Println("  continuing to reconnect verification")
 		} else {
@@ -964,7 +966,7 @@ func runInstall(binary, cwd, envMode, source, upgradeMode string, force bool, ti
 	}
 
 	reconnectDelaySec = effectiveInstallReconnectDelaySec(reconnectDelaySec, reconnectDelayExplicit, payload)
-	waitForReplacement := !reconnectDelayExplicit && isPostExitInstallScheduled(payload)
+	waitForReplacement := shouldWaitForInstallReplacement(reconnectDelayExplicit, payload, upgradeDisconnected)
 
 	fmt.Println("[install] Closing install session")
 	client.close()
@@ -1142,6 +1144,13 @@ func isPostExitInstallScheduled(payload any) bool {
 	}
 	text := strings.ToLower(status + " " + handoffError + " " + message)
 	return strings.Contains(text, "post-exit install scheduled")
+}
+
+func shouldWaitForInstallReplacement(reconnectDelayExplicit bool, payload any, upgradeDisconnected bool) bool {
+	if reconnectDelayExplicit {
+		return false
+	}
+	return upgradeDisconnected || isPostExitInstallScheduled(payload)
 }
 
 func isExpectedUpgradeDisconnect(err error) bool {

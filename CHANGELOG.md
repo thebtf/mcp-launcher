@@ -7,6 +7,8 @@ tags for public releases.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-06-16
+
 ### Fixed
 
 - `-env-mode clean` now preserves `AIMUX_STDIN_EOF_POLICY` when present so
@@ -46,4 +48,5 @@ tags for public releases.
 - Prepared the public README, contributor guide, changelog, issue templates,
   and CI metadata for GitHub publication.
 
+[0.1.1]: https://github.com/thebtf/mcp-launcher/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/thebtf/mcp-launcher/releases/tag/v0.1.0

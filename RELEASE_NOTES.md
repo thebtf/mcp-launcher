@@ -1,22 +1,25 @@
-# v0.1.0
+# v0.1.1
 
-Initial public release of `mcp-launcher`, a zero-dependency Go CLI for testing
-stdio MCP server lifecycle behavior without opening a full AI client.
+Patch release for install-mode smoke reliability when testing aimux under a
+clean launcher environment.
 
 ## Highlights
 
-- Start a real MCP stdio owner session with `hold`.
-- Probe JSON-RPC methods, MCP tools, and MCP resources from the command line.
-- Exercise daemon restart, two-phase handoff, persistence, and hard-kill
-  reconnect scenarios.
-- Verify local binary upgrade flows with `install`, including deferred
-  post-exit replacement waits and health checks.
-- Run smoke gates with expected tool count and server version assertions.
+- `-env-mode clean` now preserves `AIMUX_STDIN_EOF_POLICY` when the parent
+  process sets it.
+- Aimux install smokes can keep the eager stdin EOF contract needed for
+  post-exit shim cleanup and binary replacement.
+- Added a focused regression test for the clean environment preservation
+  contract.
 
 ## Verification
 
+- `go test -run TestCleanEnvPreservesAimuxStdinEOFPolicy -count=1`
 - `go test ./... -count=1`
+- `go test -tags=critical ./tests/critical/... -count=1`
 - `go vet .`
 - `go build .`
 - `mcp-launcher.exe -h`
-- `gitleaks` history and filesystem scans
+- `mcp-launcher.exe -mode hold` (expected `-binary is required` failure)
+- `gitleaks detect --source . --no-banner`
+- `gitleaks dir . --no-banner`

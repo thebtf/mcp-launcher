@@ -88,7 +88,7 @@ mcp-launcher -binary ./aimux-dev.exe -mode resource -uri aimux://health
 
 Emulates a project-scoped MCP client that can call `upgrade(action="apply", source=..., force=true)`. The mode starts the installed binary, calls the `upgrade` tool with `-source`, closes stdio so deferred restarts can complete, reconnects, then verifies `sessions(action="health")` and `aimux://health`. When the upgrade response reports a deferred post-exit install, the default path waits for the installed binary to change before reconnect verification spawns a new client. The replacement check polls every 15 seconds unless `-reconnect-delay` is explicitly set.
 
-`-cleanup-binary-processes` is smoke-test cleanup, not a production process manager. On Windows it currently uses image-name `taskkill`; access-denied failures can still leave a daemon alive, so use unique disposable binary names and check for survivors after a cleanup warning.
+`-cleanup-binary-processes` is smoke-test cleanup, not a production process manager. On Windows it first uses image-name `taskkill`; if that fails, it enumerates matching image-name PIDs and falls back to `Stop-Process -Id`. Use only with unique disposable binary names.
 
 ```bash
 mcp-launcher \

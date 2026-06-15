@@ -1,10 +1,12 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -27,6 +29,42 @@ func TestRunToolErrorClosesClient(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("fake MCP server did not observe stdin close; marker %s was not written", marker)
+}
+
+func TestCleanupBinaryProcessesFallsBackToPIDCleanupOnAccessDenied(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-only cleanup behavior")
+	}
+
+	original := runCommandCombinedOutput
+	t.Cleanup(func() { runCommandCombinedOutput = original })
+
+	var stopped []string
+	runCommandCombinedOutput = func(name string, args ...string) ([]byte, error) {
+		command := name + " " + strings.Join(args, " ")
+		switch {
+		case name == "taskkill" && strings.Contains(command, "/IM unique-smoke.exe"):
+			return []byte("ERROR: Access denied"), errors.New("exit status 1")
+		case strings.EqualFold(name, "powershell") && strings.Contains(command, "Get-CimInstance"):
+			return []byte("21132\r\n21133\r\n"), nil
+		case strings.EqualFold(name, "powershell") && strings.Contains(command, "Stop-Process -Id"):
+			stopped = append(stopped, command)
+			return nil, nil
+		default:
+			t.Fatalf("unexpected command: %s", command)
+			return nil, nil
+		}
+	}
+
+	if err := cleanupBinaryProcesses(`C:\tmp\unique-smoke.exe`); err != nil {
+		t.Fatalf("cleanupBinaryProcesses returned error: %v", err)
+	}
+	if len(stopped) != 2 {
+		t.Fatalf("Stop-Process calls = %d, want 2; calls=%v", len(stopped), stopped)
+	}
+	if !strings.Contains(stopped[0], "Stop-Process -Id 21132") || !strings.Contains(stopped[1], "Stop-Process -Id 21133") {
+		t.Fatalf("unexpected Stop-Process calls: %v", stopped)
+	}
 }
 
 func buildFakeMCPServer(t *testing.T) string {

@@ -71,6 +71,9 @@ type sessionInfo struct {
 }
 
 var sessionRequestTimeout = 30 * time.Second
+var runCommandCombinedOutput = func(name string, args ...string) ([]byte, error) {
+	return exec.Command(name, args...).CombinedOutput()
+}
 
 const (
 	defaultInstallReconnectDelaySec  = 2
@@ -448,19 +451,79 @@ func cleanupBinaryProcesses(binary string) error {
 
 	switch runtime.GOOS {
 	case "windows":
-		cmd := exec.Command("taskkill", "/F", "/IM", name)
-		out, err := cmd.CombinedOutput()
+		out, err := runCommandCombinedOutput("taskkill", "/F", "/IM", name)
 		if err != nil {
 			output := strings.TrimSpace(string(out))
 			if strings.Contains(strings.ToLower(output), "not found") {
 				return nil
 			}
-			return fmt.Errorf("taskkill %s: %w: %s", name, err, output)
+			if fallbackErr := cleanupWindowsProcessesByImageWithPIDFallback(name); fallbackErr == nil {
+				return nil
+			} else {
+				return fmt.Errorf("taskkill %s: %w: %s; PID fallback failed: %v", name, err, output, fallbackErr)
+			}
 		}
 		return nil
 	default:
 		return fmt.Errorf("cleanup-binary-processes is not implemented on %s", runtime.GOOS)
 	}
+}
+
+func cleanupWindowsProcessesByImageWithPIDFallback(name string) error {
+	pids, err := listWindowsProcessIDsByImage(name)
+	if err != nil {
+		return err
+	}
+	if len(pids) == 0 {
+		return nil
+	}
+
+	var failures []string
+	for _, pid := range pids {
+		if err := stopWindowsProcessByID(pid); err != nil {
+			failures = append(failures, err.Error())
+		}
+	}
+	if len(failures) > 0 {
+		return errors.New(strings.Join(failures, "; "))
+	}
+	return nil
+}
+
+func listWindowsProcessIDsByImage(name string) ([]int, error) {
+	escapedName := strings.ReplaceAll(name, "'", "''")
+	script := fmt.Sprintf(`$ErrorActionPreference = 'Stop'; Get-CimInstance Win32_Process -Filter "Name = '%s'" | ForEach-Object { [int]$_.ProcessId }`, escapedName)
+	out, err := runCommandCombinedOutput("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
+	if err != nil {
+		return nil, formatCommandError("enumerate Windows processes", err, out)
+	}
+
+	var pids []int
+	for _, line := range strings.Fields(string(out)) {
+		pid, err := strconv.Atoi(strings.TrimSpace(line))
+		if err != nil {
+			return nil, fmt.Errorf("parse Windows process id %q: %w", line, err)
+		}
+		pids = append(pids, pid)
+	}
+	return pids, nil
+}
+
+func stopWindowsProcessByID(pid int) error {
+	script := fmt.Sprintf(`$ErrorActionPreference = 'Stop'; Stop-Process -Id %d -Force -ErrorAction Stop`, pid)
+	out, err := runCommandCombinedOutput("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
+	if err != nil {
+		return formatCommandError(fmt.Sprintf("Stop-Process -Id %d", pid), err, out)
+	}
+	return nil
+}
+
+func formatCommandError(action string, err error, out []byte) error {
+	output := strings.TrimSpace(string(out))
+	if output == "" {
+		return fmt.Errorf("%s: %w", action, err)
+	}
+	return fmt.Errorf("%s: %w: %s", action, err, output)
 }
 
 // ---------------------------------------------------------------------------

@@ -5,11 +5,14 @@
 // Modes:
 //
 //	hold   — spawn server, hold session open for external testing (default)
-//	test   — single-phase: daemon + owner + graceful-restart + verify
-//	phase2 — two-phase: bootstrap + restart on successor (deadlock reproducer)
+//	call   — call any JSON-RPC method after MCP initialize
 //	tool   — call any MCP tool by name with JSON arguments
 //	resource — read any MCP resource by URI
 //	install — install a local binary through the server's upgrade tool, then reconnect and verify health
+//	test   — single-phase: daemon + owner + graceful-restart + verify
+//	phase2 — two-phase: bootstrap + restart on successor (deadlock reproducer)
+//	persist — verify daemon survives stdio disconnect and reconnect
+//	kill-reconnect — hard-kill daemon and measure new-session recovery
 package main
 
 import (
@@ -1239,7 +1242,7 @@ func main() {
 	mode := flag.String("mode", "hold", "mode: hold, call, tool, resource, install, test, phase2, persist, kill-reconnect")
 	holdSec := flag.Int("hold", 300, "hold duration in seconds (hold mode)")
 	watchSec := flag.Int("watch", 60, "watch duration in seconds after disconnect (persist mode)")
-	ctlSocket := flag.String("ctl", "", "daemon control socket path (required for test/phase2)")
+	ctlSocket := flag.String("ctl", "", "daemon control socket path (required for test/phase2/persist/kill-reconnect)")
 	daemonFlag := flag.String("daemon-flag", "--muxcore-daemon", "flag to start server in daemon mode")
 	envMode := flag.String("env-mode", "full", "environment mode: full (CC-style) or clean (Codex-style)")
 	timeoutSec := flag.Int("timeout", 120, "MCP request timeout in seconds, including initialize and tools/list")

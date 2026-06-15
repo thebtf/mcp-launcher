@@ -2,4 +2,14 @@ mcp-launcher
 mcp-launcher.exe
 *.old
 *.tmp
+
 .agent/data/
+.agent/debug/
+.agent/reports/
+.agent/security/
+.agent/session-state/
+.agent/CONTINUITY.md
+.agent/CONTINUITY-archive/
+
+.serena/
+.gomodcache/

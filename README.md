@@ -1,8 +1,23 @@
 # mcp-launcher
 
-MCP stdio server launcher that emulates how Claude Code and Codex spawn MCP servers as subprocesses. Use it to test graceful restart, hot-swap handoff, session lifecycle, and MCP protocol compliance without running a live AI client.
+[![CI](https://github.com/thebtf/mcp-launcher/actions/workflows/ci.yml/badge.svg)](https://github.com/thebtf/mcp-launcher/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/thebtf/mcp-launcher.svg)](https://pkg.go.dev/github.com/thebtf/mcp-launcher)
+[![Go Report Card](https://goreportcard.com/badge/github.com/thebtf/mcp-launcher)](https://goreportcard.com/report/github.com/thebtf/mcp-launcher)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-windows%20%7C%20macos%20%7C%20linux-lightgrey?style=flat-square)](#requirements)
 
-## Install
+`mcp-launcher` is a zero-dependency Go CLI for exercising stdio MCP servers
+without opening a full AI client. It starts a target server as a subprocess,
+performs the MCP initialize flow, keeps a real stdio owner alive, and can probe
+tools, resources, daemon restarts, reconnects, and binary upgrade paths from the
+command line.
+
+Use it when a server behaves differently under a real stdio client than it does
+under a hand-written unit test.
+
+## Quick Start
+
+Install with Go:
 
 ```bash
 go install github.com/thebtf/mcp-launcher@latest
@@ -11,194 +26,330 @@ go install github.com/thebtf/mcp-launcher@latest
 Or build from source:
 
 ```bash
-git clone https://github.com/thebtf/mcp-launcher
+git clone https://github.com/thebtf/mcp-launcher.git
 cd mcp-launcher
+go test ./...
 go build .
 ```
 
-Zero external dependencies — stdlib only.
+Start a live MCP stdio session against your server:
 
-## Usage
+```bash
+mcp-launcher -binary ./my-mcp-server -mode hold -hold 600
+```
 
+Call a tool and print both the raw MCP response and decoded text payload:
+
+```bash
+mcp-launcher \
+  -binary ./my-mcp-server \
+  -mode tool \
+  -tool sessions \
+  -args '{"action":"health"}'
 ```
-mcp-launcher -binary <server> [options]
+
+Read an MCP resource:
+
+```bash
+mcp-launcher \
+  -binary ./my-mcp-server \
+  -mode resource \
+  -uri my-server://health
 ```
+
+## Why This Exists
+
+Manual server launches hide client lifecycle bugs. A real stdio MCP client owns
+stdin, reads stdout line-by-line, handles notifications while waiting for
+responses, sends `notifications/initialized`, and may disconnect or reconnect at
+awkward times.
+
+`mcp-launcher` gives you that pressure without the rest of an AI application:
+
+- Reproduce restart handoff failures with an actual subprocess owner.
+- Verify that `tools/list`, `tools/call`, and `resources/read` work after the
+  initialize handshake.
+- Exercise daemon control sockets while the stdio client is still connected.
+- Check that deferred binary installs become visible before reconnect
+  verification starts.
+- Switch between full inherited environment and a clean allow-list environment.
+
+## Requirements
+
+- Go 1.22 or newer.
+- A target MCP stdio server binary.
+- No runtime dependencies beyond the Go standard library.
+- A daemon control socket only for `test`, `phase2`, `persist`, and
+  `kill-reconnect` modes.
+
+Windows, macOS, and Linux are supported for stdio launch flows. The
+`-cleanup-binary-processes` helper is Windows-only.
+
+## Commands
+
+```text
+mcp-launcher -binary <server> [options] [-- extra server args...]
+```
+
+### Modes
+
+| Mode | What it does |
+| --- | --- |
+| `hold` | Starts the server, completes MCP initialization, and keeps the session open for external testing. |
+| `call` | Calls any JSON-RPC method after initialization. |
+| `tool` | Calls an MCP tool through `tools/call`. |
+| `resource` | Reads an MCP resource through `resources/read`. |
+| `install` | Calls the server's `upgrade` tool with a local source binary, closes stdio, reconnects, and verifies health. |
+| `test` | Starts a daemon, connects one owner session, sends one graceful restart over the control socket, and checks the successor daemon. |
+| `phase2` | Runs two graceful restarts: original daemon, then successor daemon. Useful for handoff deadlock repros. |
+| `persist` | Verifies that a daemon survives stdio disconnect and that the next session reuses the same daemon PID. |
+| `kill-reconnect` | Hard-kills the daemon, closes stdio, then measures new-session recovery time. |
 
 ### Flags
 
 | Flag | Default | Description |
-|------|---------|-------------|
-| `-binary` | (required) | MCP server executable path |
-| `-cwd` | `.` | Working directory for the subprocess |
-| `-mode` | `hold` | Mode: `hold`, `call`, `tool`, `resource`, `install`, `test`, `phase2`, `persist`, or `kill-reconnect` |
-| `-hold` | `300` | How long to hold the session in seconds (hold mode) |
-| `-watch` | `60` | How long to watch the daemon after disconnect in seconds (persist mode) |
-| `-ctl` | (required for test/phase2/persist) | Daemon control socket path |
-| `-daemon-flag` | `--muxcore-daemon` | Flag to start server in daemon mode |
-| `-env-mode` | `full` | `full` (CC-style, inherit all env) or `clean` (Codex-style, platform allow-list) |
-| `-timeout` | `120` | MCP request timeout in seconds, including initialize and tools/list |
-| `-expect-tools` | `0` | Expected `tools/list` count after session init; `0` disables the check |
-| `-expect-version` | (empty) | Expected MCP `serverInfo.version` after session init |
-| `-method` | (empty) | JSON-RPC method for `call` mode |
-| `-params` | `{}` | JSON params for `call` mode |
-| `-tool` | (empty) | MCP tool name for `tool` mode |
-| `-args` | `{}` | JSON object arguments for `tool` mode |
-| `-uri` | (empty) | MCP resource URI for `resource` mode |
-| `-source` | (empty) | Local source binary for `install` mode |
-| `-force` | `false` | Force `upgrade(action=apply)` in `install` mode |
-| `-upgrade-mode` | `auto` | Upgrade mode for `install`: `auto`, `hot_swap`, or `deferred` |
-| `-reconnect-delay` | `2` | Initial/retry delay for `install` mode reconnect verification; post-exit installs automatically use a longer default grace window |
-| `-cleanup-binary-processes` | `false` | Best-effort cleanup after one-shot modes for remaining processes with the same image name as `-binary`; use only with unique smoke binary copies |
+| --- | --- | --- |
+| `-binary` | required | MCP server executable path. |
+| `-cwd` | `.` | Working directory for the subprocess. |
+| `-mode` | `hold` | One of `hold`, `call`, `tool`, `resource`, `install`, `test`, `phase2`, `persist`, or `kill-reconnect`. |
+| `-hold` | `300` | Seconds to keep the session open in `hold` mode. |
+| `-watch` | `60` | Seconds to watch daemon liveness after disconnect in `persist` mode. |
+| `-ctl` | empty | Daemon control socket path. Required for `test`, `phase2`, `persist`, and `kill-reconnect`. |
+| `-daemon-flag` | `--muxcore-daemon` | Flag used to start the target server in daemon mode. |
+| `-env-mode` | `full` | `full` passes the parent environment; `clean` forwards a platform allow-list. |
+| `-timeout` | `120` | MCP request timeout in seconds, including initialize and `tools/list`. |
+| `-expect-tools` | `0` | Expected `tools/list` count after session init. `0` disables the check. |
+| `-expect-version` | empty | Expected MCP `serverInfo.version` after session init. |
+| `-method` | empty | JSON-RPC method for `call` mode. |
+| `-params` | `{}` | JSON params for `call` mode. |
+| `-tool` | empty | MCP tool name for `tool` mode. |
+| `-args` | `{}` | JSON object arguments for `tool` mode. |
+| `-uri` | empty | MCP resource URI for `resource` mode. |
+| `-source` | empty | Local source binary for `install` mode. |
+| `-force` | `false` | Sends `force=true` to `upgrade(action=apply)` in `install` mode. |
+| `-upgrade-mode` | `auto` | Upgrade mode passed to the server: `auto`, `hot_swap`, or `deferred`. |
+| `-reconnect-delay` | `2` | Initial/retry delay for install reconnect verification. Explicit values override automatic post-exit waiting. |
+| `-cleanup-binary-processes` | `false` | After a one-shot mode, kill remaining Windows processes with the same image name as `-binary`. Use only with unique smoke-test binary names. |
 
-### Modes
-
-#### `hold` — keep session alive for external testing
-
-Spawns the server, completes the MCP handshake, and holds the session open. Use an external tool (e.g., `ctltest`) to trigger graceful-restart while a real owner/session exists.
+Everything after `--` is forwarded to the target server:
 
 ```bash
-mcp-launcher -binary ./my-server -mode hold -hold 600
+mcp-launcher -binary ./my-mcp-server -mode hold -- --config ./dev.json
 ```
 
-#### `call` — call any JSON-RPC method
+## Common Workflows
 
-Spawns the server, completes the MCP handshake, and calls the JSON-RPC method passed via `-method` with JSON params from `-params`.
+### Keep a real owner session alive
 
 ```bash
-mcp-launcher -binary ./my-server -mode call -method tools/list -params '{}'
+mcp-launcher -binary ./my-mcp-server -mode hold -hold 600
 ```
 
-#### `tool` — call any MCP tool
+This is the simplest way to keep stdin/stdout ownership active while another
+tool triggers a restart or inspects daemon state.
 
-Calls `tools/call` with a tool name and JSON object arguments, then prints both the raw MCP response and the decoded text payload when the tool returns JSON text.
-
-```bash
-mcp-launcher -binary ./aimux-dev.exe -mode tool -tool sessions -args '{"action":"health"}'
-```
-
-#### `resource` — read any MCP resource
-
-Calls `resources/read` for the URI passed via `-uri`, then prints both the raw MCP response and the decoded text payload when the resource returns JSON text.
-
-```bash
-mcp-launcher -binary ./aimux-dev.exe -mode resource -uri aimux://health
-```
-
-#### `install` — install a local binary through the MCP upgrade tool
-
-Emulates a project-scoped MCP client that can call `upgrade(action="apply", source=..., force=true)`. The mode starts the installed binary, calls the `upgrade` tool with `-source`, closes stdio so deferred restarts can complete, reconnects, then verifies `sessions(action="health")` and `aimux://health`. When the upgrade response reports a deferred post-exit install, the default path waits for the installed binary to change before reconnect verification spawns a new client. The replacement check polls every 15 seconds unless `-reconnect-delay` is explicitly set.
-
-`-cleanup-binary-processes` is smoke-test cleanup, not a production process manager. On Windows it first uses image-name `taskkill`; if that fails, it enumerates matching image-name PIDs and falls back to `Stop-Process -Id`. Use only with unique disposable binary names.
+### Probe a tool
 
 ```bash
 mcp-launcher \
-  -binary ./aimux-dev.exe \
-  -cwd /path/to/aimux \
-  -mode install \
-  -source ./aimux-dev-next.exe \
-  -force \
+  -binary ./my-mcp-server \
+  -mode tool \
+  -tool sessions \
+  -args '{"action":"health"}' \
   -expect-tools 27
 ```
 
-#### `test` — single-phase graceful-restart
+`-expect-tools` turns the post-initialize `tools/list` count into an assertion.
 
-Starts a daemon, creates a session with a real owner, triggers graceful-restart via the control socket, and verifies the response is delivered and the new daemon is healthy.
-
-```bash
-mcp-launcher -binary ./my-server -mode test -ctl /tmp/my-ctl.sock
-```
-
-#### `phase2` — two-phase restart (deadlock reproducer)
-
-The full test: Phase 1 restarts the original daemon (creating a successor), then Phase 2 restarts the successor. This reproduces the specific scenario where a `d.mu` deadlock occurs when owners are detached during handoff.
+### Probe a resource
 
 ```bash
-mcp-launcher -binary ./my-server -mode phase2 -ctl /tmp/my-ctl.sock
-```
-
-#### `persist` — verify daemon survives stdio disconnect
-
-Starts the daemon, opens Session A, closes stdio cleanly to simulate a Ctrl+C disconnect, polls daemon liveness for `-watch` seconds, then reconnects with Session B. `PASS` means the daemon PID stayed alive for the full watch window and Session B reattached to the same PID. `FAIL` means the daemon died or reconnect spawned a new daemon.
-
-```bash
-mcp-launcher -binary ./my-server -mode persist -ctl /tmp/my-ctl.sock -watch 60
-```
-
-## How it maps to real clients
-
-### Claude Code spawn behavior
-
-CC uses `StdioClientTransport` from `@modelcontextprotocol/sdk`:
-- Full `process.env` passed to subprocess
-- `stdin`/`stdout` piped, `stderr` piped (buffered)
-- Initialize with `clientInfo.name = "claude-code"`, capabilities: `roots`, `elicitation`
-- 30s connection timeout
-
-mcp-launcher reproduces this with `-env-mode full` (default).
-
-### Codex spawn behavior
-
-Codex uses `tokio::process::Command` with `env_clear()`:
-- Only platform allow-list vars forwarded (PATH, HOME, TEMP, etc.)
-- `kill_on_drop(true)`, `process_group(0)` on Unix
-- Initialize with `clientInfo.name = "codex-mcp-client"`, capabilities: `elicitation`
-
-mcp-launcher reproduces this with `-env-mode clean`.
-
-## MCP protocol sequence
-
-The launcher performs the standard MCP handshake:
-
-```
-launcher → server: initialize (protocolVersion, clientInfo, capabilities)
-server → launcher: initialize result (serverInfo, capabilities)
-launcher → server: notifications/initialized
-launcher → server: tools/list
-server → launcher: tools/list result
-```
-
-After the handshake, the session is live. The server has a real owner with piped stdio — identical to a CC or Codex session.
-
-## Example: testing aimux graceful restart
-
-```bash
-# Kill any existing daemons
-taskkill /IM aimux.exe /F 2>nul
-
-# Run the full two-phase test
 mcp-launcher \
-  -binary ./aimux.exe \
-  -cwd /path/to/aimux \
-  -mode phase2 \
-  -ctl "$TEMP/aimux-muxd.ctl.sock"
+  -binary ./my-mcp-server \
+  -mode resource \
+  -uri my-server://health
+```
 
-# Verify Persistent=true survives a stdio disconnect
+### Verify a deferred binary install
+
+```bash
 mcp-launcher \
-  -binary ./aimux.exe \
-  -cwd /path/to/aimux \
+  -binary ./my-server-current.exe \
+  -cwd /path/to/server/project \
+  -mode install \
+  -source ./my-server-next.exe \
+  -force \
+  -upgrade-mode auto \
+  -expect-version 1.2.3
+```
+
+`install` mode fingerprints the installed binary, calls `upgrade`, closes the
+install session, waits for post-exit replacement when the payload or disconnect
+indicates one is scheduled, reconnects, calls `sessions(action="health")`, and
+tries to read `aimux://health` when that resource exists.
+
+### Verify daemon persistence across stdio disconnect
+
+```bash
+mcp-launcher \
+  -binary ./my-server \
   -mode persist \
-  -ctl "$TEMP/aimux-muxd.ctl.sock" \
-  -watch 30
+  -ctl /tmp/my-server.ctl.sock \
+  -watch 60
 ```
 
-Expected output:
+`PASS` means the daemon PID stayed alive for the full watch window and the
+second session reattached to the same PID.
+
+## Architecture Overview
+
+```mermaid
+flowchart LR
+    CLI["mcp-launcher CLI"]
+    Client["mcpClient"]
+    Server["Target MCP stdio server"]
+    Control["Daemon control socket"]
+    Modes["Mode runner"]
+
+    CLI --> Modes
+    Modes --> Client
+    Client -- stdin JSON-RPC --> Server
+    Server -- stdout JSON-RPC --> Client
+    Modes -- status / graceful-restart --> Control
+    Control --> Server
 ```
-[phase2] Full test: Phase 1 bootstrap + Phase 2 on successor
-  daemon pid=12345
-  spawn ./aimux.exe (cwd=..., env=full)
-  pid=12346
-  initialize: {"jsonrpc":"2.0","id":1,"result":{...}}
-  tools: N
 
---- Phase 1: graceful-restart ---
-  Phase 1 OK: snapshot written, shutting down (133ms)
+The project is intentionally small:
 
---- Phase 2: graceful-restart on successor ---
-  Phase 2 OK: snapshot written, shutting down (132ms)
-  final: owner_count=0 handoff=map[attempted:1 ...]
-[phase2] Done.
+- `main.go` contains the CLI, stdio JSON-RPC client, daemon control socket
+  client, mode runners, install reconnect logic, and cleanup helpers.
+- `mcpClient` starts the target subprocess, writes JSON-RPC requests to stdin,
+  reads newline-delimited JSON-RPC from stdout, routes responses by request ID,
+  and collects notifications separately.
+- `controlSend` talks to a raw Unix domain control socket for daemon status and
+  graceful restart commands.
+- `main_test.go` and `install_reconnect_test.go` cover client cleanup on tool
+  errors, Windows PID fallback cleanup, install reconnect delay decisions,
+  post-exit install detection, replacement waiting, and binary fingerprinting.
+
+## MCP Session Flow
+
+Each session follows this sequence before the selected mode does its work:
+
+```text
+launcher -> server: initialize
+server   -> launcher: initialize result with serverInfo
+launcher -> server: notifications/initialized
+launcher -> server: tools/list
+server   -> launcher: tools/list result
+```
+
+After that, mode-specific work runs against the same live subprocess session.
+
+## Troubleshooting
+
+### `error: -binary is required`
+
+**Symptom:** The launcher exits immediately with usage text.
+
+**Cause:** `-binary` is the only required flag for every mode.
+
+**Fix:** Pass the target MCP stdio server executable:
+
+```bash
+mcp-launcher -binary ./my-mcp-server -mode hold
+```
+
+**Verify:** The output includes `spawn`, `pid=`, `initialize`, and `tools`.
+
+### `error: -ctl is required`
+
+**Symptom:** `test`, `phase2`, `persist`, or `kill-reconnect` exits before
+starting.
+
+**Cause:** Those modes need the daemon control socket.
+
+**Fix:** Pass the socket path used by your daemon:
+
+```bash
+mcp-launcher -binary ./my-mcp-server -mode phase2 -ctl /tmp/my-server.ctl.sock
+```
+
+**Verify:** The mode can print daemon status or restart results.
+
+### `timeout waiting for initialize` or `timeout waiting for tools/list`
+
+**Symptom:** The subprocess starts, but the launcher times out during bootstrap.
+
+**Cause:** The target server did not emit a JSON-RPC response on stdout before
+the timeout.
+
+**Fix:** Run the target binary directly and check that stdout is reserved for
+MCP JSON-RPC. Logs should go to stderr. Increase `-timeout` only after checking
+that the server is actually starting.
+
+**Verify:** `mcp-launcher -binary ./my-mcp-server -mode hold -timeout 120`
+prints an initialize result and a tools count.
+
+### Install mode reconnects too early
+
+**Symptom:** `install` mode reports that reconnect verification failed after an
+upgrade that schedules replacement after process exit.
+
+**Cause:** The old process may need time to exit and replace the installed
+binary.
+
+**Fix:** Let the automatic post-exit wait run, or choose an explicit delay:
+
+```bash
+mcp-launcher \
+  -binary ./my-server-current.exe \
+  -mode install \
+  -source ./my-server-next.exe \
+  -reconnect-delay 15
+```
+
+**Verify:** The output shows either `installed binary changed` or a successful
+`sessions health` payload.
+
+### `cleanup-binary-processes` removed the wrong process
+
+**Symptom:** A process with the same executable name as the smoke binary was
+terminated.
+
+**Cause:** Cleanup matches by image name on Windows.
+
+**Fix:** Use `-cleanup-binary-processes` only with unique disposable binary
+copies, such as `my-server-smoke-current.exe`.
+
+**Verify:** No unrelated process shares the same image name before enabling the
+flag.
+
+## Development
+
+```bash
+go test ./...
+go vet .
+go build .
+```
+
+The module has no third-party dependencies. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for the contributor workflow.
+
+## Repository Setup Notes
+
+Suggested GitHub description:
+
+```text
+MCP stdio launcher for restart, reconnect, resource, tool, and upgrade smoke tests.
+```
+
+Suggested topics:
+
+```text
+mcp, model-context-protocol, go, cli, devtools, testing, stdio, json-rpc, graceful-restart, smoke-testing
 ```
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

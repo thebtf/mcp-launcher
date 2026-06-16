@@ -5,12 +5,15 @@ mcp-launcher.exe
 
 .agent/data/
 .agent/debug/
+.agent/goals/
 .agent/reports/
 .agent/security/
 .agent/session-state/
 .agent/specs/
+.agent/validation/
 .agent/CONTINUITY.md
 .agent/CONTINUITY-archive/
 
 .serena/
 .gomodcache/
+outputs/

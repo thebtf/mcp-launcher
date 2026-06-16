@@ -7,6 +7,8 @@ tags for public releases.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-16
+
 ### Added
 
 - `compat` mode for profile-aware MCP stdio compatibility audits with
@@ -55,5 +57,7 @@ tags for public releases.
 - Prepared the public README, contributor guide, changelog, issue templates,
   and CI metadata for GitHub publication.
 
+[Unreleased]: https://github.com/thebtf/mcp-launcher/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/thebtf/mcp-launcher/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/thebtf/mcp-launcher/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/thebtf/mcp-launcher/releases/tag/v0.1.0

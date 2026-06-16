@@ -1,25 +1,26 @@
-# v0.1.1
+# v0.2.0
 
-Patch release for install-mode smoke reliability when testing aimux under a
-clean launcher environment.
+Feature release adding a local compatibility audit for MCP stdio servers.
 
 ## Highlights
 
-- `-env-mode clean` now preserves `AIMUX_STDIN_EOF_POLICY` when the parent
-  process sets it.
-- Aimux install smokes can keep the eager stdin EOF contract needed for
-  post-exit shim cleanup and binary replacement.
-- Added a focused regression test for the clean environment preservation
-  contract.
+- New `-mode compat` runs a profile-aware MCP stdio audit without launching a
+  real AI client.
+- Default profiles cover generic MCP behavior plus Claude Code-style and
+  Codex-style launch envelopes.
+- `-compat-level` supports `smoke`, `standard`, `lifecycle`, and `maximum`.
+- `-compat-report` writes schema-versioned JSON for CI and release gates.
+- Reserved profiles such as `fixture`, `openclaw-registry`, and `hermes` return
+  explicit evidence-needed results instead of guessed compatibility claims.
 
 ## Verification
 
-- `go test -run TestCleanEnvPreservesAimuxStdinEOFPolicy -count=1`
 - `go test ./... -count=1`
 - `go test -tags=critical ./tests/critical/... -count=1`
 - `go vet .`
 - `go build .`
 - `mcp-launcher.exe -h`
+- `mcp-launcher.exe -binary go -mode compat -compat-report .agent/reports/mcp-launcher-v0.2.0-compat-report.json -- run .\testdata\fake-mcp-server`
 - `mcp-launcher.exe -mode hold` (expected `-binary is required` failure)
 - `gitleaks detect --source . --no-banner`
 - `gitleaks dir . --no-banner`

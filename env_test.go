@@ -12,6 +12,24 @@ func TestCleanEnvPreservesAimuxStdinEOFPolicy(t *testing.T) {
 	}
 }
 
+func TestCleanEnvPreservesAimuxIsolationContract(t *testing.T) {
+	t.Setenv("AIMUX_ENGINE_NAME", "aimux-clean-smoke")
+	t.Setenv("AIMUX_SESSION_STORE", "memory")
+	t.Setenv("AIMUX_WARMUP", "false")
+
+	env := cleanEnv()
+
+	for _, want := range []string{
+		"AIMUX_ENGINE_NAME=aimux-clean-smoke",
+		"AIMUX_SESSION_STORE=memory",
+		"AIMUX_WARMUP=false",
+	} {
+		if !envContains(env, want) {
+			t.Fatalf("cleanEnv() did not preserve %s; env=%v", want, env)
+		}
+	}
+}
+
 func envContains(env []string, want string) bool {
 	for _, entry := range env {
 		if entry == want {

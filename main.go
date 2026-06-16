@@ -565,7 +565,17 @@ func cleanEnv() []string {
 			"LANG", "LC_ALL", "TERM", "TMPDIR", "TZ",
 		}
 	}
-	keys = append(keys, "AIMUX_STDIN_EOF_POLICY")
+	keys = append(keys,
+		"AIMUX_STDIN_EOF_POLICY",
+		"AIMUX_ENGINE_NAME",
+		"AIMUX_SESSION_STORE",
+		"AIMUX_WARMUP",
+		"AIMUX_CONFIG_DIR",
+		"AIMUX_NO_ENGINE",
+		"AIMUX_POST_EXIT_HELPER_DIR",
+		"AIMUX_UPGRADE_SOURCE_DIR",
+		"AIMUX_ALLOW_UPGRADE_SOURCE_OUTSIDE_BIN_DIR",
+	)
 	var env []string
 	for _, k := range keys {
 		if v, ok := os.LookupEnv(k); ok {
@@ -997,7 +1007,7 @@ func runResource(binary, cwd, envMode, uri string, timeoutSec, expectTools int, 
 	return 0
 }
 
-func runInstall(binary, cwd, envMode, source, upgradeMode string, force bool, timeoutSec, reconnectDelaySec int, reconnectDelayExplicit bool, expectTools int, expectVersion string, extraArgs []string) int {
+func runInstall(binary, cwd, envMode, source, upgradeMode string, force bool, timeoutSec, reconnectDelaySec int, reconnectDelayExplicit bool, cleanupBinary bool, expectTools int, expectVersion string, extraArgs []string) int {
 	if source == "" {
 		fmt.Fprintln(os.Stderr, "error: -source is required for install mode")
 		return 1
@@ -1054,6 +1064,12 @@ func runInstall(binary, cwd, envMode, source, upgradeMode string, force bool, ti
 
 	fmt.Println("[install] Closing install session")
 	client.close()
+
+	if cleanupBinary && (waitForReplacement || isPostExitInstallScheduled(payload)) {
+		if err := cleanupBinaryProcesses(binary); err != nil {
+			fmt.Fprintf(os.Stderr, "  WARN cleanup-binary-processes before reconnect: %v\n", err)
+		}
+	}
 
 	if waitForReplacement {
 		if err := waitForInstallBinaryReplacement(binary, initialBinary, timeoutSec, reconnectDelaySec); err != nil {
@@ -1231,9 +1247,6 @@ func isPostExitInstallScheduled(payload any) bool {
 }
 
 func shouldWaitForInstallReplacement(reconnectDelayExplicit bool, payload any, upgradeDisconnected bool) bool {
-	if reconnectDelayExplicit {
-		return false
-	}
 	return upgradeDisconnected || isPostExitInstallScheduled(payload)
 }
 
@@ -1339,7 +1352,7 @@ func main() {
 	case "resource":
 		exitCode = runResource(*binary, *cwd, *envMode, *uri, *timeoutSec, *expectTools, *expectVersion, extraArgs)
 	case "install":
-		exitCode = runInstall(*binary, *cwd, *envMode, *source, *upgradeMode, *force, *timeoutSec, *reconnectDelaySec, reconnectDelayExplicit, *expectTools, *expectVersion, extraArgs)
+		exitCode = runInstall(*binary, *cwd, *envMode, *source, *upgradeMode, *force, *timeoutSec, *reconnectDelaySec, reconnectDelayExplicit, *cleanupBinary, *expectTools, *expectVersion, extraArgs)
 	case "test":
 		runTest(*binary, *cwd, *envMode, *ctlSocket, *daemonFlag, extraArgs)
 	case "phase2":

@@ -140,13 +140,13 @@ func TestShouldWaitForInstallReplacement(t *testing.T) {
 			want:       true,
 		},
 		{
-			name:                   "explicit reconnect delay overrides automatic wait",
+			name:                   "explicit reconnect delay still waits for post-exit replacement",
 			reconnectDelayExplicit: true,
 			payload: map[string]any{
 				"status": "updated_deferred",
 			},
 			upgradeErr: errors.New("connection closed while waiting for tools/call"),
-			want:       false,
+			want:       true,
 		},
 		{
 			name: "ordinary payload does not wait",

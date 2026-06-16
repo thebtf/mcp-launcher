@@ -59,12 +59,13 @@ type mcpClient struct {
 	stdin   *os.File
 	scanner *bufio.Scanner
 
-	mu        sync.Mutex
-	nextID    int
-	pending   map[int]chan json.RawMessage
-	notifCh   chan jsonRPCMessage
-	closeCh   chan struct{}
-	closeOnce sync.Once
+	mu                 sync.Mutex
+	nextID             int
+	pending            map[int]chan json.RawMessage
+	notifCh            chan jsonRPCMessage
+	closeCh            chan struct{}
+	closeOnce          sync.Once
+	invalidStdoutLines int
 }
 
 type sessionInfo struct {
@@ -90,20 +91,14 @@ type fileFingerprint struct {
 }
 
 func newMCPClient(binary, cwd, envMode string, extraArgs []string) (*mcpClient, error) {
+	return newMCPClientWithEnv(binary, cwd, envForMode(envMode), extraArgs)
+}
+
+func newMCPClientWithEnv(binary, cwd string, env []string, extraArgs []string) (*mcpClient, error) {
 	cmd := exec.Command(binary, extraArgs...)
 	cmd.Dir = cwd
 	cmd.Stderr = os.Stderr
-
-	switch envMode {
-	case "full":
-		// CC behavior: pass full parent env
-		cmd.Env = os.Environ()
-	case "clean":
-		// Codex behavior: platform allow-list only
-		cmd.Env = cleanEnv()
-	default:
-		cmd.Env = os.Environ()
-	}
+	cmd.Env = env
 
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
@@ -133,6 +128,19 @@ func newMCPClient(binary, cwd, envMode string, extraArgs []string) (*mcpClient, 
 	return c, nil
 }
 
+func envForMode(envMode string) []string {
+	switch envMode {
+	case "full":
+		// CC behavior: pass full parent env
+		return os.Environ()
+	case "clean":
+		// Codex behavior: platform allow-list only
+		return cleanEnv()
+	default:
+		return os.Environ()
+	}
+}
+
 func (c *mcpClient) readLoop() {
 	defer c.closeOnce.Do(func() { close(c.closeCh) })
 	for c.scanner.Scan() {
@@ -142,6 +150,9 @@ func (c *mcpClient) readLoop() {
 		}
 		var msg jsonRPCMessage
 		if err := json.Unmarshal(line, &msg); err != nil {
+			c.mu.Lock()
+			c.invalidStdoutLines++
+			c.mu.Unlock()
 			continue
 		}
 		if msg.isResponse() {
@@ -164,6 +175,12 @@ func (c *mcpClient) readLoop() {
 			}
 		}
 	}
+}
+
+func (c *mcpClient) invalidStdoutCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.invalidStdoutLines
 }
 
 func (c *mcpClient) call(method string, params any, timeout time.Duration) (json.RawMessage, error) {
@@ -1240,13 +1257,16 @@ func isExpectedUpgradeDisconnect(err error) bool {
 func main() {
 	binary := flag.String("binary", "", "MCP server executable (required)")
 	cwd := flag.String("cwd", ".", "working directory for subprocess")
-	mode := flag.String("mode", "hold", "mode: hold, call, tool, resource, install, test, phase2, persist, kill-reconnect")
+	mode := flag.String("mode", "hold", "mode: hold, call, tool, resource, install, test, phase2, persist, kill-reconnect, compat")
 	holdSec := flag.Int("hold", 300, "hold duration in seconds (hold mode)")
 	watchSec := flag.Int("watch", 60, "watch duration in seconds after disconnect (persist mode)")
 	ctlSocket := flag.String("ctl", "", "daemon control socket path (required for test/phase2/persist/kill-reconnect)")
 	daemonFlag := flag.String("daemon-flag", "--muxcore-daemon", "flag to start server in daemon mode")
 	envMode := flag.String("env-mode", "full", "environment mode: full (CC-style) or clean (Codex-style)")
 	timeoutSec := flag.Int("timeout", 120, "MCP request timeout in seconds, including initialize and tools/list")
+	compatLevelFlag := flag.String("compat-level", "standard", "compat audit level: smoke, standard, lifecycle, or maximum")
+	compatProfilesFlag := flag.String("compat-profiles", "generic,claude-code,codex", "comma-separated compat profiles: generic, claude-code, codex, fixture, openclaw-registry, hermes")
+	compatReportFlag := flag.String("compat-report", "", "write compat audit JSON report to this path")
 	reconnectDelaySec := flag.Int("reconnect-delay", defaultInstallReconnectDelaySec, "initial/retry delay in seconds for install reconnect verification")
 	expectTools := flag.Int("expect-tools", 0, "expected tools/list count after session init (0 disables)")
 	expectVersion := flag.String("expect-version", "", "expected MCP serverInfo.version after session init")
@@ -1280,8 +1300,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  test    Single-phase graceful-restart test")
 		fmt.Fprintln(os.Stderr, "  phase2  Two-phase restart test (deadlock reproducer)")
 		fmt.Fprintln(os.Stderr, "  persist Verify daemon stays alive across stdio disconnect + reconnect")
+		fmt.Fprintln(os.Stderr, "  compat  Run profile-aware MCP stdio compatibility audit")
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintln(os.Stderr, "  mcp-launcher -binary ./my-server -mode hold")
+		fmt.Fprintln(os.Stderr, "  mcp-launcher -binary ./my-server -mode compat -compat-level standard")
 		fmt.Fprintln(os.Stderr, "  mcp-launcher -binary ./aimux-dev.exe -mode tool -tool sessions -args '{\"action\":\"health\"}'")
 		fmt.Fprintln(os.Stderr, "  mcp-launcher -binary ./aimux-dev.exe -mode resource -uri aimux://health")
 		fmt.Fprintln(os.Stderr, "  mcp-launcher -binary ./aimux-dev.exe -mode install -source ./aimux-dev-next.exe -force -expect-tools 27")
@@ -1326,8 +1348,21 @@ func main() {
 		runPersist(*binary, *cwd, *envMode, *ctlSocket, *daemonFlag, *watchSec, extraArgs)
 	case "kill-reconnect":
 		runKillReconnect(*binary, *cwd, *envMode, *ctlSocket, *daemonFlag, extraArgs)
+	case "compat":
+		exitCode = runCompatMode(compatConfig{
+			Binary:      *binary,
+			CWD:         *cwd,
+			EnvMode:     *envMode,
+			Timeout:     time.Duration(*timeoutSec) * time.Second,
+			CtlSocket:   *ctlSocket,
+			Source:      *source,
+			ExtraArgs:   extraArgs,
+			LevelRaw:    *compatLevelFlag,
+			ProfilesRaw: *compatProfilesFlag,
+			ReportPath:  *compatReportFlag,
+		})
 	default:
-		fmt.Fprintf(os.Stderr, "error: unknown mode %q (use hold, call, tool, resource, install, test, phase2, persist, or kill-reconnect)\n", *mode)
+		fmt.Fprintf(os.Stderr, "error: unknown mode %q (use hold, call, tool, resource, install, test, phase2, persist, kill-reconnect, or compat)\n", *mode)
 		os.Exit(1)
 	}
 	if *cleanupBinary {

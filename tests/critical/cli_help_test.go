@@ -25,8 +25,11 @@ func TestCLIHelpListsDocumentedModesAndFlags(t *testing.T) {
 	for _, want := range []string{
 		"-binary string",
 		"-mode string",
-		"hold, call, tool, resource, install, test, phase2, persist, kill-reconnect",
+		"hold, call, tool, resource, install, test, phase2, persist, kill-reconnect, compat",
 		"daemon control socket path (required for test/phase2/persist/kill-reconnect)",
+		"-compat-level string",
+		"-compat-profiles string",
+		"-compat-report string",
 		"-cleanup-binary-processes",
 	} {
 		if !strings.Contains(help, want) {

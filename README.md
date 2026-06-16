@@ -74,6 +74,8 @@ awkward times.
   verification starts.
 - Switch between full inherited environment and a clean allow-list environment
   that still preserves lifecycle-critical EOF policy when set.
+- Run a profile-aware compatibility audit that separates generic MCP behavior
+  from Claude Code-style and Codex-style launch envelopes.
 
 ## Requirements
 
@@ -105,6 +107,7 @@ mcp-launcher -binary <server> [options] [-- extra server args...]
 | `phase2` | Runs two graceful restarts: original daemon, then successor daemon. Useful for handoff deadlock repros. |
 | `persist` | Verifies that a daemon survives stdio disconnect and that the next session reuses the same daemon PID. |
 | `kill-reconnect` | Hard-kills the daemon, closes stdio, then measures new-session recovery time. |
+| `compat` | Runs a profile-aware MCP stdio compatibility audit and optionally writes a JSON report. |
 
 ### Flags
 
@@ -112,13 +115,16 @@ mcp-launcher -binary <server> [options] [-- extra server args...]
 | --- | --- | --- |
 | `-binary` | required | MCP server executable path. |
 | `-cwd` | `.` | Working directory for the subprocess. |
-| `-mode` | `hold` | One of `hold`, `call`, `tool`, `resource`, `install`, `test`, `phase2`, `persist`, or `kill-reconnect`. |
+| `-mode` | `hold` | One of `hold`, `call`, `tool`, `resource`, `install`, `test`, `phase2`, `persist`, `kill-reconnect`, or `compat`. |
 | `-hold` | `300` | Seconds to keep the session open in `hold` mode. |
 | `-watch` | `60` | Seconds to watch daemon liveness after disconnect in `persist` mode. |
 | `-ctl` | empty | Daemon control socket path. Required for `test`, `phase2`, `persist`, and `kill-reconnect`. |
 | `-daemon-flag` | `--muxcore-daemon` | Flag used to start the target server in daemon mode. |
 | `-env-mode` | `full` | `full` passes the parent environment; `clean` forwards a platform allow-list and preserves `AIMUX_STDIN_EOF_POLICY` when set. |
 | `-timeout` | `120` | MCP request timeout in seconds, including initialize and `tools/list`. |
+| `-compat-level` | `standard` | Compatibility audit breadth: `smoke`, `standard`, `lifecycle`, or `maximum`. |
+| `-compat-profiles` | `generic,claude-code,codex` | Comma-separated profiles for `compat`: `generic`, `claude-code`, `codex`, `fixture`, `openclaw-registry`, or `hermes`. Reserved profiles return evidence-needed results until backed by docs or traces. |
+| `-compat-report` | empty | Writes the compatibility audit JSON report to the provided path. |
 | `-expect-tools` | `0` | Expected `tools/list` count after session init. `0` disables the check. |
 | `-expect-version` | empty | Expected MCP `serverInfo.version` after session init. |
 | `-method` | empty | JSON-RPC method for `call` mode. |
@@ -170,6 +176,33 @@ mcp-launcher \
   -mode resource \
   -uri my-server://health
 ```
+
+### Run a compatibility audit
+
+```bash
+mcp-launcher \
+  -binary ./my-mcp-server \
+  -mode compat \
+  -compat-level standard \
+  -compat-report compat-report.json
+```
+
+The default audit runs `generic`, `claude-code`, and `codex` profiles. Results
+stay separated so a server can pass generic MCP checks while a named host
+envelope reports `FAIL`, `BLOCKED`, or `UNSUPPORTED`.
+
+Compatibility levels are cumulative:
+
+| Level | Use when |
+| --- | --- |
+| `smoke` | You only need startup and MCP initialize proof. |
+| `standard` | You want the default local compatibility matrix. |
+| `lifecycle` | You also want lifecycle checks that need `-ctl`. Missing inputs are `BLOCKED`. |
+| `maximum` | You want all currently known checks, including install-source prerequisites. Missing inputs are `BLOCKED`. |
+
+Reserved profiles such as `fixture`, `openclaw-registry`, and `hermes` do not
+guess behavior. They return an evidence-needed result until primary docs or a
+captured fixture trace exists.
 
 ### Verify a deferred binary install
 

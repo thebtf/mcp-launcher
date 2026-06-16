@@ -7,6 +7,13 @@ tags for public releases.
 
 ## [Unreleased]
 
+### Added
+
+- `compat` mode for profile-aware MCP stdio compatibility audits with
+  `generic`, `claude-code`, and `codex` result surfaces.
+- `-compat-level`, `-compat-profiles`, and `-compat-report` for compatibility
+  breadth, profile selection, and JSON report output.
+
 ## [0.1.1] - 2026-06-16
 
 ### Fixed

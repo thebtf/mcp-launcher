@@ -1,17 +1,20 @@
-# v0.2.0
+# v0.3.0
 
-Feature release adding a local compatibility audit for MCP stdio servers.
+Install-mode release for aimux/muxcore upgrade acceptance gates.
 
 ## Highlights
 
-- New `-mode compat` runs a profile-aware MCP stdio audit without launching a
-  real AI client.
-- Default profiles cover generic MCP behavior plus Claude Code-style and
-  Codex-style launch envelopes.
-- `-compat-level` supports `smoke`, `standard`, `lifecycle`, and `maximum`.
-- `-compat-report` writes schema-versioned JSON for CI and release gates.
-- Reserved profiles such as `fixture`, `openclaw-registry`, and `hermes` return
-  explicit evidence-needed results instead of guessed compatibility claims.
+- New `-install-validation active-pointer` mode validates muxcore successor
+  installs where the stable `-binary` path intentionally does not change.
+- New `-active-engine-file` flag points the launcher at the active successor
+  pointer file, defaulting to `MCPMUX_ACTIVE_ENGINE_FILE`.
+- `-env-mode clean` now preserves the aimux smoke isolation/update contract,
+  including engine name, session store, warmup, upgrade helper variables, and
+  `MCPMUX_ACTIVE_ENGINE_FILE`.
+- Install verification keeps waiting for post-exit replacement even when an
+  explicit reconnect delay is supplied.
+- Cleanup of disposable smoke binaries now runs before replacement/reconnect
+  verification when the install handoff needs process cleanup.
 
 ## Verification
 
@@ -20,7 +23,7 @@ Feature release adding a local compatibility audit for MCP stdio servers.
 - `go vet .`
 - `go build .`
 - `mcp-launcher.exe -h`
-- `mcp-launcher.exe -binary go -mode compat -compat-report .agent/reports/mcp-launcher-v0.2.0-compat-report.json -- run .\testdata\fake-mcp-server`
+- `mcp-launcher.exe -binary go -mode compat -compat-report .agent/reports/mcp-launcher-v0.3.0-compat-report.json -- run .\testdata\fake-mcp-server`
 - `mcp-launcher.exe -mode hold` (expected `-binary is required` failure)
 - `gitleaks detect --source . --no-banner`
 - `gitleaks dir . --no-banner`

@@ -7,6 +7,8 @@ tags for public releases.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-18
+
 ### Added
 
 - `install` mode now supports `-install-validation active-pointer` plus
@@ -15,6 +17,13 @@ tags for public releases.
 
 ### Fixed
 
+- `-env-mode clean` now preserves the aimux install-smoke isolation contract,
+  including engine name, session store, warmup, and upgrade helper variables.
+- Explicit `-reconnect-delay` no longer disables post-exit binary replacement
+  waiting during install verification.
+- `-cleanup-binary-processes` now runs after the install session closes and
+  before post-exit replacement/reconnect verification when install handoff
+  needs it.
 - `-env-mode clean` now preserves `MCPMUX_ACTIVE_ENGINE_FILE` when present so
   active-pointer install smokes can keep the muxcore successor pointer contract.
 
@@ -68,7 +77,8 @@ tags for public releases.
 - Prepared the public README, contributor guide, changelog, issue templates,
   and CI metadata for GitHub publication.
 
-[Unreleased]: https://github.com/thebtf/mcp-launcher/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/thebtf/mcp-launcher/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/thebtf/mcp-launcher/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/thebtf/mcp-launcher/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/thebtf/mcp-launcher/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/thebtf/mcp-launcher/releases/tag/v0.1.0

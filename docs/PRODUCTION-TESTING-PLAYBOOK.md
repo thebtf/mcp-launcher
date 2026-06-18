@@ -52,6 +52,8 @@ On Windows:
   `hold`, `call`, `tool`, `resource`, `install`, `test`, `phase2`, `persist`,
   `kill-reconnect`, and `compat`.
 - Help lists `-compat-level`, `-compat-profiles`, and `-compat-report`.
+- Help lists install validation flags: `-install-validation` and
+  `-active-engine-file`.
 - `-ctl` help says it is required for `test`, `phase2`, `persist`, and
   `kill-reconnect`.
 

@@ -82,6 +82,9 @@ var runCommandCombinedOutput = func(name string, args ...string) ([]byte, error)
 const (
 	defaultInstallReconnectDelaySec  = 2
 	postExitInstallReconnectDelaySec = 15
+	installValidationReplacement     = "replacement"
+	installValidationActivePointer   = "active-pointer"
+	activeEngineFileEnv              = "MCPMUX_ACTIVE_ENGINE_FILE"
 )
 
 type fileFingerprint struct {
@@ -575,6 +578,7 @@ func cleanEnv() []string {
 		"AIMUX_POST_EXIT_HELPER_DIR",
 		"AIMUX_UPGRADE_SOURCE_DIR",
 		"AIMUX_ALLOW_UPGRADE_SOURCE_OUTSIDE_BIN_DIR",
+		activeEngineFileEnv,
 	)
 	var env []string
 	for _, k := range keys {
@@ -1007,9 +1011,14 @@ func runResource(binary, cwd, envMode, uri string, timeoutSec, expectTools int, 
 	return 0
 }
 
-func runInstall(binary, cwd, envMode, source, upgradeMode string, force bool, timeoutSec, reconnectDelaySec int, reconnectDelayExplicit bool, cleanupBinary bool, expectTools int, expectVersion string, extraArgs []string) int {
+func runInstall(binary, cwd, envMode, source, upgradeMode, installValidation, activeEngineFile string, force bool, timeoutSec, reconnectDelaySec int, reconnectDelayExplicit bool, cleanupBinary bool, expectTools int, expectVersion string, extraArgs []string) int {
 	if source == "" {
 		fmt.Fprintln(os.Stderr, "error: -source is required for install mode")
+		return 1
+	}
+	installValidation, err := normalizeInstallValidation(installValidation)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
 	initialBinary, err := fingerprintFile(binary)
@@ -1025,6 +1034,35 @@ func runInstall(binary, cwd, envMode, source, upgradeMode string, force bool, ti
 	if _, err := os.Stat(absSource); err != nil {
 		fmt.Fprintf(os.Stderr, "error: source binary is not readable: %v\n", err)
 		return 1
+	}
+
+	initialActivePointer := ""
+	if installValidation == installValidationActivePointer {
+		activeEngineFileExplicit := activeEngineFile != ""
+		if activeEngineFile == "" {
+			activeEngineFile = os.Getenv(activeEngineFileEnv)
+		}
+		if activeEngineFile == "" {
+			fmt.Fprintf(os.Stderr, "error: -active-engine-file or %s is required for -install-validation active-pointer\n", activeEngineFileEnv)
+			return 1
+		}
+		activeEngineFile, err = filepath.Abs(activeEngineFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: resolve -active-engine-file: %v\n", err)
+			return 1
+		}
+		if activeEngineFileExplicit {
+			if err := os.Setenv(activeEngineFileEnv, activeEngineFile); err != nil {
+				fmt.Fprintf(os.Stderr, "error: set %s: %v\n", activeEngineFileEnv, err)
+				return 1
+			}
+		}
+		initialActivePointer, err = readInstallActivePointer(activeEngineFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: read active engine file: %v\n", err)
+			return 1
+		}
+		fmt.Printf("[install] Active-pointer validation using %s (initial %q)\n", activeEngineFile, initialActivePointer)
 	}
 
 	fmt.Println("[install] Starting installed daemon session")
@@ -1060,12 +1098,13 @@ func runInstall(binary, cwd, envMode, source, upgradeMode string, force bool, ti
 	}
 
 	reconnectDelaySec = effectiveInstallReconnectDelaySec(reconnectDelaySec, reconnectDelayExplicit, payload)
-	waitForReplacement := shouldWaitForInstallReplacement(reconnectDelayExplicit, payload, upgradeDisconnected)
+	waitForReplacement := shouldWaitForInstallReplacement(installValidation, payload, upgradeDisconnected)
+	waitForActivePointer := shouldWaitForInstallActivePointer(installValidation)
 
 	fmt.Println("[install] Closing install session")
 	client.close()
 
-	if cleanupBinary && (waitForReplacement || isPostExitInstallScheduled(payload)) {
+	if cleanupBinary && (waitForReplacement || waitForActivePointer || isPostExitInstallScheduled(payload)) {
 		if err := cleanupBinaryProcesses(binary); err != nil {
 			fmt.Fprintf(os.Stderr, "  WARN cleanup-binary-processes before reconnect: %v\n", err)
 		}
@@ -1077,6 +1116,13 @@ func runInstall(binary, cwd, envMode, source, upgradeMode string, force bool, ti
 			return 1
 		}
 		reconnectDelaySec = 0
+	}
+
+	if waitForActivePointer {
+		if _, err := waitForInstallActivePointerUpdate(activeEngineFile, initialActivePointer, timeoutSec, reconnectDelaySec); err != nil {
+			fmt.Fprintf(os.Stderr, "  FAIL active-pointer install: %v\n", err)
+			return 1
+		}
 	}
 
 	fmt.Println("[install] Reconnecting and verifying installed daemon")
@@ -1220,6 +1266,64 @@ func fingerprintFile(path string) (fileFingerprint, error) {
 	}, nil
 }
 
+func normalizeInstallValidation(raw string) (string, error) {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	switch value {
+	case "", installValidationReplacement:
+		return installValidationReplacement, nil
+	case installValidationActivePointer, "active_pointer", "successor":
+		return installValidationActivePointer, nil
+	default:
+		return "", fmt.Errorf("unknown -install-validation %q (use %s or %s)", raw, installValidationReplacement, installValidationActivePointer)
+	}
+}
+
+func readInstallActivePointer(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	value := strings.TrimSpace(string(data))
+	if value == "" {
+		return "", errors.New("active pointer file is empty")
+	}
+	return value, nil
+}
+
+func waitForInstallActivePointerUpdate(path, before string, timeoutSec, pollDelaySec int) (string, error) {
+	pollDelay := time.Duration(pollDelaySec) * time.Second
+	if pollDelay <= 0 {
+		pollDelay = time.Second
+	}
+	timeout := time.Duration(timeoutSec) * time.Second
+	if timeout <= 0 {
+		timeout = sessionRequestTimeout
+	}
+	deadline := time.Now().Add(timeout)
+
+	for {
+		current, err := readInstallActivePointer(path)
+		if err == nil && current != before {
+			fmt.Printf("  active pointer changed: %q -> %q\n", before, current)
+			return current, nil
+		}
+		if !time.Now().Before(deadline) {
+			if err != nil {
+				return "", fmt.Errorf("active pointer did not become readable before timeout: %w", err)
+			}
+			return "", fmt.Errorf("active pointer did not change before timeout")
+		}
+
+		remaining := time.Until(deadline)
+		sleepFor := pollDelay
+		if sleepFor > remaining {
+			sleepFor = remaining
+		}
+		fmt.Printf("  waiting %s for active pointer update\n", sleepFor)
+		time.Sleep(sleepFor)
+	}
+}
+
 func effectiveInstallReconnectDelaySec(requested int, explicit bool, upgradePayload any) int {
 	if explicit {
 		return requested
@@ -1246,8 +1350,15 @@ func isPostExitInstallScheduled(payload any) bool {
 	return strings.Contains(text, "post-exit install scheduled")
 }
 
-func shouldWaitForInstallReplacement(reconnectDelayExplicit bool, payload any, upgradeDisconnected bool) bool {
+func shouldWaitForInstallReplacement(installValidation string, payload any, upgradeDisconnected bool) bool {
+	if installValidation != installValidationReplacement {
+		return false
+	}
 	return upgradeDisconnected || isPostExitInstallScheduled(payload)
+}
+
+func shouldWaitForInstallActivePointer(installValidation string) bool {
+	return installValidation == installValidationActivePointer
 }
 
 func isExpectedUpgradeDisconnect(err error) bool {
@@ -1275,7 +1386,7 @@ func main() {
 	watchSec := flag.Int("watch", 60, "watch duration in seconds after disconnect (persist mode)")
 	ctlSocket := flag.String("ctl", "", "daemon control socket path (required for test/phase2/persist/kill-reconnect)")
 	daemonFlag := flag.String("daemon-flag", "--muxcore-daemon", "flag to start server in daemon mode")
-	envMode := flag.String("env-mode", "full", "environment mode: full (CC-style) or clean (Codex-style)")
+	envMode := flag.String("env-mode", "full", "environment mode: full (CC-style) or clean (Codex-style with selected smoke contract variables preserved)")
 	timeoutSec := flag.Int("timeout", 120, "MCP request timeout in seconds, including initialize and tools/list")
 	compatLevelFlag := flag.String("compat-level", "standard", "compat audit level: smoke, standard, lifecycle, or maximum")
 	compatProfilesFlag := flag.String("compat-profiles", "generic,claude-code,codex", "comma-separated compat profiles: generic, claude-code, codex, fixture, openclaw-registry, hermes")
@@ -1291,6 +1402,8 @@ func main() {
 	source := flag.String("source", "", "local source binary for install mode")
 	force := flag.Bool("force", false, "force upgrade apply in install mode")
 	upgradeMode := flag.String("upgrade-mode", "auto", "upgrade mode for install: auto, hot_swap, or deferred")
+	installValidation := flag.String("install-validation", installValidationReplacement, "install validation strategy: replacement or active-pointer")
+	activeEngineFile := flag.String("active-engine-file", "", "active pointer file for install -install-validation active-pointer; defaults to MCPMUX_ACTIVE_ENGINE_FILE")
 	cleanupBinary := flag.Bool("cleanup-binary-processes", false, "after one-shot mode completes, kill remaining processes with the same image name as -binary; use only with unique smoke binary copies")
 	flag.Parse()
 	sessionRequestTimeout = time.Duration(*timeoutSec) * time.Second
@@ -1352,7 +1465,7 @@ func main() {
 	case "resource":
 		exitCode = runResource(*binary, *cwd, *envMode, *uri, *timeoutSec, *expectTools, *expectVersion, extraArgs)
 	case "install":
-		exitCode = runInstall(*binary, *cwd, *envMode, *source, *upgradeMode, *force, *timeoutSec, *reconnectDelaySec, reconnectDelayExplicit, *cleanupBinary, *expectTools, *expectVersion, extraArgs)
+		exitCode = runInstall(*binary, *cwd, *envMode, *source, *upgradeMode, *installValidation, *activeEngineFile, *force, *timeoutSec, *reconnectDelaySec, reconnectDelayExplicit, *cleanupBinary, *expectTools, *expectVersion, extraArgs)
 	case "test":
 		runTest(*binary, *cwd, *envMode, *ctlSocket, *daemonFlag, extraArgs)
 	case "phase2":

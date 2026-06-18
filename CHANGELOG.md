@@ -7,6 +7,17 @@ tags for public releases.
 
 ## [Unreleased]
 
+### Added
+
+- `install` mode now supports `-install-validation active-pointer` plus
+  `-active-engine-file` for muxcore successor installs where the stable
+  `-binary` path is intentionally not replaced.
+
+### Fixed
+
+- `-env-mode clean` now preserves `MCPMUX_ACTIVE_ENGINE_FILE` when present so
+  active-pointer install smokes can keep the muxcore successor pointer contract.
+
 ## [0.2.0] - 2026-06-16
 
 ### Added

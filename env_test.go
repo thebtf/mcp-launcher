@@ -16,6 +16,7 @@ func TestCleanEnvPreservesAimuxIsolationContract(t *testing.T) {
 	t.Setenv("AIMUX_ENGINE_NAME", "aimux-clean-smoke")
 	t.Setenv("AIMUX_SESSION_STORE", "memory")
 	t.Setenv("AIMUX_WARMUP", "false")
+	t.Setenv(activeEngineFileEnv, `D:\tmp\aimux-active.txt`)
 
 	env := cleanEnv()
 
@@ -23,6 +24,7 @@ func TestCleanEnvPreservesAimuxIsolationContract(t *testing.T) {
 		"AIMUX_ENGINE_NAME=aimux-clean-smoke",
 		"AIMUX_SESSION_STORE=memory",
 		"AIMUX_WARMUP=false",
+		activeEngineFileEnv + `=D:\tmp\aimux-active.txt`,
 	} {
 		if !envContains(env, want) {
 			t.Fatalf("cleanEnv() did not preserve %s; env=%v", want, env)

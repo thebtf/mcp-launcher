@@ -120,7 +120,7 @@ mcp-launcher -binary <server> [options] [-- extra server args...]
 | `-watch` | `60` | Seconds to watch daemon liveness after disconnect in `persist` mode. |
 | `-ctl` | empty | Daemon control socket path. Required for `test`, `phase2`, `persist`, and `kill-reconnect`. |
 | `-daemon-flag` | `--muxcore-daemon` | Flag used to start the target server in daemon mode. |
-| `-env-mode` | `full` | `full` passes the parent environment; `clean` forwards a platform allow-list and preserves `AIMUX_STDIN_EOF_POLICY` when set. |
+| `-env-mode` | `full` | `full` passes the parent environment; `clean` forwards a platform allow-list and preserves aimux/muxcore smoke contract variables when set. |
 | `-timeout` | `120` | MCP request timeout in seconds, including initialize and `tools/list`. |
 | `-compat-level` | `standard` | Compatibility audit breadth: `smoke`, `standard`, `lifecycle`, or `maximum`. |
 | `-compat-profiles` | `generic,claude-code,codex` | Comma-separated profiles for `compat`: `generic`, `claude-code`, `codex`, `fixture`, `openclaw-registry`, or `hermes`. Reserved profiles return evidence-needed results until backed by docs or traces. |
@@ -135,7 +135,9 @@ mcp-launcher -binary <server> [options] [-- extra server args...]
 | `-source` | empty | Local source binary for `install` mode. |
 | `-force` | `false` | Sends `force=true` to `upgrade(action=apply)` in `install` mode. |
 | `-upgrade-mode` | `auto` | Upgrade mode passed to the server: `auto`, `hot_swap`, or `deferred`. |
-| `-reconnect-delay` | `2` | Initial/retry delay for install reconnect verification. Explicit values override automatic post-exit waiting. |
+| `-install-validation` | `replacement` | Install proof strategy: `replacement` waits for `-binary` to change when a post-exit install is scheduled; `active-pointer` waits for an active pointer file to change and then verifies reconnect health/version. |
+| `-active-engine-file` | empty | Active pointer file for `-install-validation active-pointer`; defaults to `MCPMUX_ACTIVE_ENGINE_FILE`. |
+| `-reconnect-delay` | `2` | Initial/retry delay for install reconnect verification. Explicit values override the automatic post-exit reconnect delay, not replacement detection. |
 | `-cleanup-binary-processes` | `false` | After a one-shot mode, kill remaining Windows processes with the same image name as `-binary`. Use only with unique smoke-test binary names. |
 
 Everything after `--` is forwarded to the target server:
@@ -217,12 +219,32 @@ mcp-launcher \
   -expect-version 1.2.3
 ```
 
-`install` mode fingerprints the installed binary, calls `upgrade`, closes the
-install session, waits for post-exit replacement when the payload or disconnect
-indicates one is scheduled, reconnects, calls `sessions(action="health")`, and
-tries to read `aimux://health` when that resource exists. With `-env-mode clean`,
-the launcher still preserves `AIMUX_STDIN_EOF_POLICY` from the parent
-environment so aimux shims can use eager stdin EOF during install handoff.
+By default, `install` mode fingerprints the installed binary, calls `upgrade`,
+closes the install session, waits for post-exit replacement when the payload or
+disconnect indicates one is scheduled, reconnects, calls
+`sessions(action="health")`, and tries to read `aimux://health` when that
+resource exists.
+
+For muxcore active-pointer/successor installs where the stable `-binary` path is
+intentionally not replaced, use active-pointer validation:
+
+```bash
+mcp-launcher \
+  -binary ./my-server-current.exe \
+  -cwd /path/to/server/project \
+  -mode install \
+  -source ./my-server-next.exe \
+  -force \
+  -install-validation active-pointer \
+  -active-engine-file ./active.txt \
+  -expect-version 1.2.3
+```
+
+Active-pointer validation reads the pointer before `upgrade`, waits for it to
+change after handoff, then treats reconnect health, tool count, and expected
+version as the install proof. With `-env-mode clean`, the launcher still
+preserves aimux/muxcore smoke contract variables from the parent environment,
+including `AIMUX_STDIN_EOF_POLICY` and `MCPMUX_ACTIVE_ENGINE_FILE`.
 
 ### Verify daemon persistence across stdio disconnect
 
